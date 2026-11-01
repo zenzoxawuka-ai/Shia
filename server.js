@@ -44,8 +44,8 @@ function purgeCatalogServiceSnapshots(){
 }
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
-const APP_VERSION = '3.0';
-const BUILD_ID = 'SADA-3.0-LIVE-PROVIDER-STATUS-REAL-COUNTS-PINNED-CATEGORY-PRICE-SORT-20261101-R13';
+const APP_VERSION = '3.2';
+const BUILD_ID = 'SADA-3.2-R13-ABSOLUTE-PINS-ORDER-TELEGRAM-RAILWAY-STABILITY-20261101';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -342,6 +342,76 @@ function catalogRowGroups(row){
   const out=[],seen=new Set();const add=value=>{const name=String(value??'').trim(),key=normalizeCatalogLabel(name);if(name&&key&&!seen.has(key)){seen.add(key);out.push(name)}};
   if(Array.isArray(row?.groups))row.groups.forEach(add);if(Array.isArray(row?.categories))row.categories.forEach(add);add(row?.category);return out;
 }
+const CATALOG_PLATFORM_ALIASES={
+  instagram:['instagram','insta','انستغرام','انستجرام','انستقرام','انستا'],
+  tiktok:['tiktok','تيكتوك','تيك توك'],youtube:['youtube','يوتيوب'],facebook:['facebook','فيسبوك','فيس بوك','فيس'],
+  telegram:['telegram','تلجرام','تيليجرام','تليجرام','تلغرام'],twitter:['twitter','تويتر','x','xcom'],
+  snapchat:['snapchat','سناب','سنابشات','سناب شات'],whatsapp:['whatsapp','واتساب','واتس اب'],
+  linkedin:['linkedin','لينكدان','لينكدإن'],other:['other','اخرى','أخرى','عام']
+};
+function catalogPlatformScope(value){
+  const raw=normalizeCatalogLabel(value).normalize('NFKC').replace(/[أإآٱ]/g,'ا').replace(/ى/g,'ي').replace(/[\s._-]+/g,'');
+  for(const [scope,aliases] of Object.entries(CATALOG_PLATFORM_ALIASES))if(aliases.some(alias=>{const k=normalizeCatalogLabel(alias).normalize('NFKC').replace(/[أإآٱ]/g,'ا').replace(/ى/g,'ي').replace(/[\s._-]+/g,'');return raw===k||raw.includes(k)}))return scope;
+  return '';
+}
+function catalogRowHasPlatform(row,scope,metaRoot={}){
+  const values=[];for(const key of ['apps','platforms','app','platform','serviceApp','servicePlatform','network','site']){const value=row?.[key];if(Array.isArray(value))values.push(...value);else if(value)values.push(value);}
+  if(values.length)return values.some(value=>catalogPlatformScope(value)===scope);
+  const aliases=Object.values(CATALOG_PLATFORM_ALIASES[scope]||[]).map(normalizeCatalogLabel);
+  return catalogRowGroups(row).some(group=>{
+    const meta=Object.values(metaRoot||{}).find(value=>normalizeCatalogLabel(value?.name||'')===normalizeCatalogLabel(group));
+    const platforms=[...(Array.isArray(meta?.platforms)?meta.platforms:[]),meta?.platform,meta?.imagePlatform].filter(Boolean);
+    return platforms.some(value=>catalogPlatformScope(value)===scope)||(!platforms.length&&aliases.length===0);
+  });
+}
+function applyCatalogPinnedPositions(entries){
+  const rows=Array.isArray(entries)?entries.slice():[];
+  const priceCompare=(a,b)=>{const av=a.minPrice===null||a.minPrice===undefined?Number.POSITIVE_INFINITY:Number(a.minPrice),bv=b.minPrice===null||b.minPrice===undefined?Number.POSITIVE_INFINITY:Number(b.minPrice);return av-bv||String(a.name||'').localeCompare(String(b.name||''),'ar');};
+  const fixed=rows.filter(entry=>Number.isInteger(entry.pinPosition)&&entry.pinPosition>0).sort((a,b)=>a.pinPosition-b.pinPosition||String(a.name||'').localeCompare(String(b.name||''),'ar'));
+  const floating=rows.filter(entry=>!(Number.isInteger(entry.pinPosition)&&entry.pinPosition>0)).sort(priceCompare);
+  const ordered=[];
+  for(const entry of fixed){const target=Math.min(rows.length-1,entry.pinPosition-1);while(ordered.length<target&&floating.length)ordered.push(floating.shift());ordered.push(entry);}
+  ordered.push(...floating);
+  return ordered;
+}
+function catalogSectionIndexForPlatform(platformValue){
+  const scope=catalogPlatformScope(platformValue);if(!scope)return {ok:false,error:'المنصة المختارة غير معروفة'};
+  const metaRoot=catalogObject(readJSON('category_meta.json',{}));
+  const services={...catalogObject(readJSON('services.json',{})),...catalogObject(readAdminFreeServices()),...catalogObject(readAdminManualServices())};
+  const byName=new Map();
+  const add=(name,row=null)=>{
+    const label=String(name||'').trim(),key=normalizeCatalogLabel(label);if(!label||!key)return;
+    let entry=byName.get(key);if(!entry){entry={name:label,count:0,minPrice:null,serviceKeys:[]};byName.set(key,entry);}
+    if(row){entry.count++;entry.serviceKeys.push(String(row.fbKey||row.key||row.siteServiceId||row.id||''));
+      let price=null;
+      for(const field of ['sellingUsd','rateUsd','orderPriceUsd','fixedPriceUsd','providerRateUsd','smmRateUsd','smmRate','rate']){const raw=row[field];if(raw===undefined||raw===null||String(raw).trim()==='')continue;const n=Number(raw);if(Number.isFinite(n)&&n>=0){price=n;break;}}
+      if(price===null&&row.price!==undefined&&row.price!==null&&String(row.price).trim()!==''){const n=Number(row.price);if(Number.isFinite(n)&&n>=0)price=n/FIXED_RATE;}
+      if(price!==null&&(entry.minPrice===null||price<entry.minPrice))entry.minPrice=price;
+    }
+  };
+  for(const [key,row] of Object.entries(services)){
+    if(!row||typeof row!=='object'||Array.isArray(row)||row.deleted===true||row.enabled===false||row.active===false||row.unapprovedAutoImport===true)continue;
+    if(!catalogRowHasPlatform(row,scope,metaRoot))continue;
+    for(const group of catalogRowGroups(row))add(group,{...row,fbKey:row.fbKey||key});
+  }
+  for(const [key,meta] of Object.entries(metaRoot)){
+    if(!meta||typeof meta!=='object')continue;
+    const name=String(meta.name||key).trim();if(!name)continue;
+    const platforms=[...(Array.isArray(meta.platforms)?meta.platforms:[]),meta.platform,meta.imagePlatform,meta.pinnedPlatform].filter(Boolean);
+    const linked=(Array.isArray(meta.serviceKeys)?meta.serviceKeys:[]).some(serviceKey=>{
+      const row=services[String(serviceKey)];return row&&catalogRowHasPlatform(row,scope,metaRoot)&&row.deleted!==true&&row.enabled!==false;
+    });
+    if(platforms.some(value=>catalogPlatformScope(value)===scope)||linked){add(name,null);}
+  }
+  const settings=catalogObject(readJSON('catalog_settings.json',{})).catalogOrder||{};
+  const scoped=catalogObject(catalogObject(settings.platforms)[scope]);
+  const pins=catalogObject(scoped.pinnedPositions);
+  const pinFor=name=>{const match=Object.entries(pins).find(([key])=>normalizeCatalogLabel(key)===normalizeCatalogLabel(name));const n=Number(match?.[1]);return Number.isInteger(n)&&n>0?n:null;};
+  const entries=[...byName.values()].map(entry=>({...entry,pinPosition:pinFor(entry.name)}));
+  // Pinned positions are absolute slots; all other sections fill gaps in ascending price order.
+  const ordered=applyCatalogPinnedPositions(entries);
+  return {ok:true,platform:scope,sections:ordered.map((entry,index)=>({...entry,currentPosition:index+1,serviceKeys:undefined}))};
+}
 function canonicalCatalogOrder(orderValue,metaRoot=readJSON('category_meta.json',{})){
   const order=orderValue&&typeof orderValue==='object'&&!Array.isArray(orderValue)?{...orderValue}:{};
   const existing=Array.isArray(order.categories)?order.categories.map(x=>String(x??'').trim()).filter(Boolean):[];
@@ -537,17 +607,20 @@ function catalogMergeOrder(remoteValue,localValue,metaRoot,servicesRoot){
   const serviceOrders={};
   const buckets=new Set([...Object.keys(catalogObject(remote.services)),...Object.keys(catalogObject(local.services))]);
   for(const bucket of buckets){const arr=[],seen=new Set();for(const v of [...(Array.isArray(local.services?.[bucket])?local.services[bucket]:[]),...(Array.isArray(remote.services?.[bucket])?remote.services[bucket]:[])]){const key=String(v??'');if(key&&!seen.has(key)){seen.add(key);arr.push(key)}}serviceOrders[bucket]=arr;}
-  const mergeUniqueArrays=(a,b)=>{const out=[],seen=new Set();for(const value of [...(Array.isArray(a)?a:[]),...(Array.isArray(b)?b:[])]){const key=String(value??'');if(key&&!seen.has(key)){seen.add(key);out.push(value)}}return out;};
+  // Preserve platform-scoped options (especially pinnedPositions) across every Firebase
+  // catalog merge/reload. A previous merge rebuilt only categories/services and silently
+  // discarded this subtree, which made manually pinned sections appear to reset.
   const platforms={};
-  for(const scope of new Set([...Object.keys(catalogObject(remote.platforms)),...Object.keys(catalogObject(local.platforms))])){
-    const r=catalogObject(remote.platforms?.[scope]),l=catalogObject(local.platforms?.[scope]);
-    const services={};for(const bucket of new Set([...Object.keys(catalogObject(r.services)),...Object.keys(catalogObject(l.services))]))services[bucket]=mergeUniqueArrays(l.services?.[bucket],r.services?.[bucket]);
-    platforms[scope]={...r,...l,categories:mergeUniqueArrays(l.categories,r.categories),services,categoryPins:{...catalogObject(r.categoryPins),...catalogObject(l.categoryPins)}};
+  const platformKeys=new Set([...Object.keys(catalogObject(local.platforms)),...Object.keys(catalogObject(remote.platforms))]);
+  for(const scope of platformKeys){
+    const lp=catalogObject(local.platforms?.[scope]),rp=catalogObject(remote.platforms?.[scope]);
+    const mergedScope={...lp,...rp};
+    const lpins=catalogObject(lp.pinnedPositions),rpins=catalogObject(rp.pinnedPositions);
+    if(Object.keys(lpins).length||Object.keys(rpins).length)mergedScope.pinnedPositions={...lpins,...rpins};
+    platforms[scope]=mergedScope;
   }
-  const sortModes={...catalogObject(remote.sortModes),...catalogObject(local.sortModes)};
-  for(const scope of new Set([...Object.keys(catalogObject(remote.sortModes)),...Object.keys(catalogObject(local.sortModes))]))sortModes[scope]={...catalogObject(remote.sortModes?.[scope]),...catalogObject(local.sortModes?.[scope])};
-  const mergedPins={...catalogObject(remote.categoryPins),...catalogObject(local.categoryPins)};
-  return canonicalCatalogOrder({ ...remote, ...local, categories, services:serviceOrders, allServices:mergeUniqueArrays(local.allServices,remote.allServices), platforms, sortModes, categoryPins:mergedPins },metaRoot);
+  const merged={...local,...remote,categories,services:serviceOrders,platforms};
+  return canonicalCatalogOrder(merged,metaRoot);
 }
 async function persistFirebaseCatalogPatch(patch,options={}){
   if(!patch||typeof patch!=='object'||Array.isArray(patch)||!Object.keys(patch).length)return {count:0};
@@ -2568,12 +2641,11 @@ function auditNormalizeRecord(order={},source='firebase',sourceKey=''){
     providerName:String(o.providerName||o.provider||o.smmProviderName||'').trim(),providerId:String(o.providerId||o.provider_id||o.smmProviderId||'').trim(),providerOrderId,
     amountIQD:Number(o.totalIQD??o.totalIqd??o.total_iqd??o.amountIQD??o.amountIqd??o.chargeIQD??o.chargeIqd??o.priceIQD??o.priceIqd??o.amount??NaN),
     lastCheckedAt:o.lastCheckedAt||o.lastChecked||o.providerCheckedAt||null,
-    statusSyncLastAttemptAt:o.statusSyncLastAttemptAt||o.lastCheckedAt||o.lastChecked||null,
     updatedAt:o.updatedAt||o.updated_at||o.lastUpdatedAt||null,
     completedAt:o.completedAt||o.completed_at||o.finishedAt||null,
     cancelledAt:o.cancelledAt||o.cancelled_at||o.cancelAt||null,
     cancelReason:String(o.cancelReason||o.cancellationReason||o.failureReason||o.reason||''),
-    remains:o.remains??null,startCount:o.startCount??o.start_count??null,endCount:o.endCount??o.end_count??o.afterCount??o.after_count??null,refundState:String(o.refundState||''),refundAmountIQD:Number(o.refundAmountIQD||0),
+    remains:o.remains??null,startCount:o.startCount??o.start_count??null,refundState:String(o.refundState||''),refundAmountIQD:Number(o.refundAmountIQD||0),
     source, firebaseKey:source==='firebase'?String(sourceKey||''):'',
     legacyHistory:!!o.legacyHistory, readOnly:!!o.readOnly,
     siteLocalId:source==='server'?String(id||''):'',
@@ -2624,7 +2696,8 @@ async function loadOrderAuditSnapshot(force=false){
   return ORDER_AUDIT_SNAPSHOT_CACHE;
 }
 // Background monitors share one bounded snapshot. Rather than downloading the whole orders node,
-// read the latest 500 orders and indexed active/refund-relevant statuses only.
+// read a modest recent window and a smaller indexed active/refund-relevant window;
+// the monitor runs every minute, so keeping this bounded is important on small Railway plans.
 let ORDER_MONITOR_SNAPSHOT_AT=0;
 let ORDER_MONITOR_SNAPSHOT_VALUE=null;
 let ORDER_MONITOR_SNAPSHOT_PROMISE=null;
@@ -2634,7 +2707,10 @@ async function loadOrderMonitorSnapshot(){
   if(ORDER_MONITOR_SNAPSHOT_PROMISE)return ORDER_MONITOR_SNAPSHOT_PROMISE;
   ORDER_MONITOR_SNAPSHOT_PROMISE=(async()=>{
     const statuses=['pending','processing','in progress','in_progress','creating_provider','provider_pending','partial','partially completed','cancelled','canceled','ملغي','ملغى','قيد الانتظار','قيد التنفيذ'];
-    const jobs=[firebaseGetQueryJson('orders',{orderBy:'\"$key\"',limitToLast:500},10000),...statuses.map(status=>firebaseGetQueryJson('orders',{orderBy:'\"status\"',equalTo:JSON.stringify(status),limitToLast:500},10000))];
+    // The previous 14 x 500 status queries repeatedly downloaded up to 7,500 records
+    // every minute. Keep each indexed status window small and rely on the recent window
+    // for newly-created orders; this lowers Firebase egress and Railway heap pressure.
+    const jobs=[firebaseGetQueryJson('orders',{orderBy:'\"$key\"',limitToLast:300},10000),...statuses.map(status=>firebaseGetQueryJson('orders',{orderBy:'\"status\"',equalTo:JSON.stringify(status),limitToLast:80},8500))];
     const settled=await Promise.allSettled(jobs),raw=new Map();let successes=0;const errors=[];
     settled.forEach((result,index)=>{
       if(result.status!=='fulfilled'){errors.push(String(result.reason?.message||'تعذر تحميل جزء من الطلبات').slice(0,100));return;}
@@ -2651,13 +2727,13 @@ async function loadOrderMonitorSnapshot(){
     if(Array.isArray(local))for(const o of local){if(!o||typeof o!=='object'||o.event)continue;const row=auditNormalizeRecord(o,'server',String(o.id||''));if(!row.id&&!row.providerOrderId&&!row.createdMs)continue;const id=auditIdentity(row),prior=merged.get(id);if(!prior)merged.set(id,{...row,_auditSources:['server'],_serverOrderId:row.siteLocalId||''});else{const winner={...row,...prior};for(const [field,value] of Object.entries(row))if((winner[field]===undefined||winner[field]===null||winner[field]==='')&&value!==undefined&&value!==null&&value!=='')winner[field]=value;winner._auditSources=[...new Set([...(prior._auditSources||[]),'server'])];winner._firebaseKey=prior._firebaseKey||row.firebaseKey||'';winner._serverOrderId=prior._serverOrderId||row.siteLocalId||'';merged.set(id,winner);}}
     const providers=providerStore().providers||{};
     const rows=[...merged.values()].map(row=>({...row,providerName:row.providerName||(providers[row.providerId]?.name||''),status:auditStatus(row.status||row.rawStatus)}));
-    return {at:Date.now(),rows,firebaseAvailable:successes>0,firebaseError:errors.slice(0,2).join(' | '),loaded:true,bounded:true,queryCount:successes};
+    const durationMs=Date.now()-now;if(durationMs>8000||errors.length)console.warn('[ORDER_MONITOR_SNAPSHOT]',JSON.stringify({durationMs,rows:rows.length,querySuccesses:successes,queryFailures:errors.length,errors:errors.slice(0,2),bounded:true}));return {at:Date.now(),rows,firebaseAvailable:successes>0,firebaseError:errors.slice(0,2).join(' | '),loaded:true,bounded:true,queryCount:successes,durationMs};
   })().then(snapshot=>{ORDER_MONITOR_SNAPSHOT_VALUE=snapshot;ORDER_MONITOR_SNAPSHOT_AT=Date.now();return snapshot;}).finally(()=>{ORDER_MONITOR_SNAPSHOT_PROMISE=null;});
   return ORDER_MONITOR_SNAPSHOT_PROMISE;
 }
 function auditPublicRecord(row,now=Date.now(),delayHours=3){
   const createdMs=Number(row.createdMs||auditOrderTime(row)||0)||null;const ageMs=createdMs?Math.max(0,now-createdMs):null;const status=auditStatus(row.status||row.rawStatus);
-  return {id:String(row.id||''),siteOrderId:String(row.siteOrderId||row.id||''),publicOrderNo:String((/^\d{1,9}$/.test(String(row.publicOrderNo||''))&&Number(row.publicOrderNo)>=3000)?row.publicOrderNo:(/^\d{1,9}$/.test(String(row.id||''))&&Number(row.id)>=3000?row.id:'')),user:String(row.user||''),userName:String(row.userName||row.user||'—'),email:String(row.email||''),serviceName:String(row.serviceName||'خدمة'),serviceId:String(row.serviceId||''),platform:String(row.platform||auditPlatform(row)),serviceApp:String(row.serviceApp||''),link:String(row.link||''),quantity:Number(row.quantity||0),status,rawStatus:String(row.rawStatus||status),createdAt:row.createdAt||null,createdMs,ageMs,overdue:!row.legacyHistory&&!!(ageMs!==null&&ageMs>delayHours*3600000&&!auditTerminalStatus(status)),providerName:String(row.providerName||'—'),providerId:String(row.providerId||''),providerOrderId:String(row.providerOrderId||''),lastCheckedAt:row.lastCheckedAt||null,statusSyncLastAttemptAt:row.statusSyncLastAttemptAt||row.lastCheckedAt||null,updatedAt:row.updatedAt||null,completedAt:row.completedAt||null,cancelledAt:row.cancelledAt||null,cancelReason:String(row.cancelReason||''),remains:row.remains??null,startCount:row.startCount??null,endCount:row.endCount??null,amountUsd:Number.isFinite(row.amountUsd)?row.amountUsd:null,source:String(row.source||''),sourceKey:String(row._firebaseKey||row.firebaseKey||''),legacyHistory:!!row.legacyHistory,readOnly:!!row.legacyHistory||!!row.readOnly,sources:Array.isArray(row._auditSources)?row._auditSources:[row.source].filter(Boolean)};
+  return {id:String(row.id||''),siteOrderId:String(row.siteOrderId||row.id||''),publicOrderNo:String((/^\d{1,9}$/.test(String(row.publicOrderNo||''))&&Number(row.publicOrderNo)>=3000)?row.publicOrderNo:(/^\d{1,9}$/.test(String(row.id||''))&&Number(row.id)>=3000?row.id:'')),user:String(row.user||''),userName:String(row.userName||row.user||'—'),email:String(row.email||''),serviceName:String(row.serviceName||'خدمة'),serviceId:String(row.serviceId||''),platform:String(row.platform||auditPlatform(row)),serviceApp:String(row.serviceApp||''),link:String(row.link||''),quantity:Number(row.quantity||0),status,rawStatus:String(row.rawStatus||status),createdAt:row.createdAt||null,createdMs,ageMs,overdue:!row.legacyHistory&&!!(ageMs!==null&&ageMs>delayHours*3600000&&!auditTerminalStatus(status)),providerName:String(row.providerName||'—'),providerId:String(row.providerId||''),providerOrderId:String(row.providerOrderId||''),lastCheckedAt:row.lastCheckedAt||null,updatedAt:row.updatedAt||null,completedAt:row.completedAt||null,cancelledAt:row.cancelledAt||null,cancelReason:String(row.cancelReason||''),remains:row.remains??null,startCount:row.startCount??null,amountUsd:Number.isFinite(row.amountUsd)?row.amountUsd:null,source:String(row.source||''),sourceKey:String(row._firebaseKey||row.firebaseKey||''),legacyHistory:!!row.legacyHistory,readOnly:!!row.legacyHistory||!!row.readOnly,sources:Array.isArray(row._auditSources)?row._auditSources:[row.source].filter(Boolean)};
 }
 function auditPageFilter(rows,params,settings){
   const now=Date.now(),delayMs=settings.delayHours*3600000;
@@ -2903,14 +2979,6 @@ async function applyVerifiedOrderRefund(inputOrder={},providerData={},normalized
   const responseState=settledState!=='credited'?settledState:(status==='partial'&&finalTotal>0?'partial_credited':(status==='refunded'?'refunded':'credited'));
   return {ok:true,credited:!!result.credited,state:responseState,amountIQD:Number(result.deltaIQD||0),totalRefundIQD:finalTotal,balanceIQD:Number(result.balanceIQD??transaction.value?.balance??0),currency:'IQD',reason:result.reason||''};
 }
-function providerMetricNumber(data,keys){
-  const roots=[data,data?.data,data?.result,data?.order,data?.data?.order,data?.result?.order].filter(v=>v&&typeof v==='object');
-  for(const root of roots)for(const key of keys){
-    const raw=root[key];if(raw===undefined||raw===null||String(raw).trim()==='')continue;
-    const value=Number(String(raw).replace(/[٬,\s]/g,''));if(Number.isFinite(value)&&value>=0)return value;
-  }
-  return null;
-}
 async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
   const rawStatus=extractProviderStatus(providerData);
   const normalized=normalizeProviderStatus(normalizedStatus||rawStatus);
@@ -2921,10 +2989,8 @@ async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
   const update={providerStatus:providerRaw,providerStatusConfirmed:true,statusSyncState:'confirmed',statusSyncLastAttemptAt:checkedAt,statusSyncAttempts:Math.max(1,Number(full.statusSyncAttempts||0)+1),initialStatusChecked:true,initialStatusError:'',lastCheckedAt:checkedAt,updatedAt:checkedAt,status:normalized};
   const providerRemains=providerData?.remains??providerData?.remaining??providerData?.data?.remains??providerData?.data?.remaining??providerData?.result?.remains??providerData?.result?.remaining;
   if(providerRemains!==undefined)update.remains=providerRemains;
-  const providerStartCount=providerMetricNumber(providerData,['start_count','startCount','startcount','initial_count','initialCount']);
-  if(providerStartCount!==null)update.startCount=providerStartCount;
-  const providerEndCount=providerMetricNumber(providerData,['end_count','endCount','after_count','afterCount','final_count','finalCount','current_count','currentCount']);
-  if(providerEndCount!==null)update.endCount=providerEndCount;
+  const providerStartCount=providerData?.start_count??providerData?.startCount??providerData?.data?.start_count??providerData?.data?.startCount??providerData?.result?.start_count??providerData?.result?.startCount;
+  if(providerStartCount!==undefined)update.startCount=providerStartCount;
 
   const fbKey=String(full._firebaseKey||full.firebaseKey||'').trim();
   // Do not credit a wallet until the provider-confirmed status is durably attached to the canonical Firebase order.
@@ -2936,9 +3002,7 @@ async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
     const verify=await firebaseGetJson(fbPath,7000);
     const statusVerified=verify&&normalizeProviderStatus(verify.status||'')===normalized;
     const providerVerified=verify&&String(verify.providerStatus||'')===providerRaw&&verify.providerStatusConfirmed===true;
-    const startCountVerified=update.startCount===undefined||Number(verify?.startCount)===Number(update.startCount);
-    const endCountVerified=update.endCount===undefined||Number(verify?.endCount)===Number(update.endCount);
-    if(!statusVerified||!providerVerified||!startCountVerified||!endCountVerified)throw new Error('تعذر التحقق من حفظ حالة المزود أو أعداد البداية/النهاية في سجل الطلب الأساسي.');
+    if(!statusVerified||!providerVerified)throw new Error('تعذر التحقق من حفظ حالة المزود في سجل الطلب الأساسي.');
   }catch(e){
     return {ok:false,saved:false,order:full,refund:null,error:String(e.message||e).slice(0,180)};
   }
@@ -3106,19 +3170,12 @@ async function runProviderRejectionRefundMonitor(){
 }
 
 async function runRefundReconciliationMonitor(){
-  // Poll a small fair batch every 15 seconds. Each status is saved only after a recognized provider response and Firebase read-back verification.
+  // Check in-flight provider orders at approximately one-minute intervals; cap work per cycle to avoid provider API bursts.
   if(runRefundReconciliationMonitor.running)return;runRefundReconciliationMonitor.running=true;
   try{
-    const snapshot=await loadOrderMonitorSnapshot();if(!snapshot.rows?.length)return;const now=Date.now();
-    const candidates=snapshot.rows.filter(r=>r.providerId&&r.providerOrderId&&(['pending','processing'].includes(r.status)||(['cancelled','partial','failed','refunded'].includes(r.status)&&!['credited','partial_credited','refunded','no_refund_due'].includes(String(r.refundState||''))))&&(!r.statusSyncLastAttemptAt||now-(auditTimestamp(r.statusSyncLastAttemptAt)||0)>=12000)).sort((a,b)=>(auditTimestamp(a.statusSyncLastAttemptAt||a.lastCheckedAt)||0)-(auditTimestamp(b.statusSyncLastAttemptAt||b.lastCheckedAt)||0)||Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,3);
-    for(const row of candidates){
-      try{
-        const full=await resolveFinancialOrder(row);await ensureProviderRuntime(row.providerId);const prov=getProviderById(row.providerId,{allowSingleFallback:false}).prov;
-        const checked=await checkAndSyncProviderOrderStatus({...full,_firebaseKey:full._firebaseKey||row._firebaseKey||row.firebaseKey||''},prov,{attempts:1,timeoutMs:5000});
-        if(checked?.order)Object.assign(row,checked.order);
-        else row.statusSyncLastAttemptAt=nowISO();
-      }catch(e){row.statusSyncLastAttemptAt=nowISO();console.warn('refund/order status monitor:',String(e.message||e).slice(0,120));}
-    }
+    const snapshot=await loadOrderMonitorSnapshot();if(!snapshot.rows?.length)return;const now=Date.now();let examined=0;
+    const candidates=snapshot.rows.filter(r=>r.providerId&&r.providerOrderId&&(['pending','processing'].includes(r.status)||(['cancelled','partial','failed','refunded'].includes(r.status)&&!['credited','partial_credited','refunded','no_refund_due'].includes(String(r.refundState||''))))&&(!r.lastCheckedAt||now-(auditTimestamp(r.lastCheckedAt)||0)>30000)).sort((a,b)=>Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,12);
+    for(const row of candidates){if(examined++>=12)break;try{const full=await resolveFinancialOrder(row);await ensureProviderRuntime(row.providerId);const prov=getProviderById(row.providerId,{allowSingleFallback:false}).prov;if(!prov?.url||!prov?.key)continue;const d=await providerRequest(prov,{action:'status',order:String(row.providerOrderId)},15000);const normalized=normalizeProviderStatus(extractProviderStatus(d));if(normalized==='unknown')continue;await syncVerifiedOrderStatus(full,d,normalized);}catch(e){console.warn('refund/order status monitor:',String(e.message||e).slice(0,120));}}
   }catch(e){console.warn('refund reconciliation monitor:',String(e.message||e).slice(0,160));}finally{runRefundReconciliationMonitor.running=false;}
 }
 
@@ -4512,8 +4569,8 @@ function findInternalApiService(id){
   const sid=String(id||'').trim();if(!/^\d{4,}$/.test(sid))return null;
   return internalApiServices().find(x=>String(x.siteServiceId)===sid||serviceRowMatchesSiteId(x,sid))||null;
 }
-function apiOrderPublic(o){return {order_id:String(o.publicOrderNo||o.id||''),internal_order_id:String(o.id||''),status:String(o.status||'pending'),service:String(o.siteServiceId||o.serviceId||''),quantity:Number(o.quantity||0),charge:Number(Number(o.chargeUsd||0).toFixed(6)),chargeUsd:Number(Number(o.chargeUsd||0).toFixed(6)),currency:'USD',remains:o.remains===undefined?null:o.remains,start_count:o.startCount===undefined?null:o.startCount,end_count:o.endCount===undefined?null:o.endCount,createdAt:o.createdAt||null};}
-function apiSmmStatus(o){const status=String(o?.status||'pending');return {charge:Number(Number(o?.chargeUsd||0).toFixed(6)),currency:'USD',start_count:o?.startCount??null,end_count:o?.endCount??null,status,remains:o?.remains??null,order_id:String(o?.publicOrderNo||o?.id||''),service:String(o?.siteServiceId||o?.serviceId||''),quantity:Number(o?.quantity||0),updatedAt:o?.lastCheckedAt||o?.updatedAt||null};}
+function apiOrderPublic(o){return {order_id:String(o.publicOrderNo||o.id||''),internal_order_id:String(o.id||''),status:String(o.status||'pending'),service:String(o.siteServiceId||o.serviceId||''),quantity:Number(o.quantity||0),charge:Number(Number(o.chargeUsd||0).toFixed(6)),chargeUsd:Number(Number(o.chargeUsd||0).toFixed(6)),currency:'USD',remains:o.remains===undefined?null:o.remains,start_count:o.startCount===undefined?null:o.startCount,createdAt:o.createdAt||null};}
+function apiSmmStatus(o){const status=String(o?.status||'pending');return {charge:Number(Number(o?.chargeUsd||0).toFixed(6)),currency:'USD',start_count:o?.startCount??null,status,remains:o?.remains??null,order_id:String(o?.publicOrderNo||o?.id||''),service:String(o?.siteServiceId||o?.serviceId||''),quantity:Number(o?.quantity||0),updatedAt:o?.lastCheckedAt||o?.updatedAt||null};}
 
 function apiScopeAllows(auth,scope){
   const scopes=auth?.record?.scopes;
@@ -4691,8 +4748,7 @@ async function apiStatusForOrder(auth,order){
     const d=await providerRequest(prov,{action:'status',order:String(order.providerOrderId)},20000);const status=extractProviderStatus(d);const normalized=normalizeProviderStatus(status);
     if(!String(status||'').trim()||normalized==='unknown')return {http:502,body:{error:'Provider status response did not contain a recognized status; the saved order was not marked successful.',stage:'provider_status',uncertain:true}};
     const oldStatus=normalizeProviderStatus(order.providerStatusConfirmed===true?order.providerStatus:(order.status||''));
-    const apiStartCount=providerMetricNumber(d,['start_count','startCount','startcount','initial_count','initialCount']);const apiEndCount=providerMetricNumber(d,['end_count','endCount','after_count','afterCount','final_count','finalCount','current_count','currentCount']);
-    let current={...order,providerStatus:String(status||order.providerStatus||''),providerStatusConfirmed:true,status:normalized,lastCheckedAt:nowISO(),statusSyncLastAttemptAt:nowISO(),updatedAt:nowISO(),providerRaw:safeProviderResponse(d),remains:d?.remains??d?.data?.remains??order.remains,startCount:apiStartCount??order.startCount,endCount:apiEndCount??order.endCount,providerCharge:d?.charge??d?.data?.charge??order.providerCharge,providerCurrency:d?.currency??d?.data?.currency??order.providerCurrency};
+    let current={...order,providerStatus:String(status||order.providerStatus||''),providerStatusConfirmed:true,status:normalized,lastCheckedAt:nowISO(),updatedAt:nowISO(),providerRaw:safeProviderResponse(d),remains:d?.remains??d?.data?.remains??order.remains,startCount:d?.start_count??d?.startCount??d?.data?.start_count??order.startCount,providerCharge:d?.charge??d?.data?.charge??order.providerCharge,providerCurrency:d?.currency??d?.data?.currency??order.providerCurrency};
     current=await persistApiOrderUpdate(current);
     let refund=null;if(['cancelled','partial','failed','refunded'].includes(current.status))refund=await applyVerifiedOrderRefund(current,d,current.status);
     if(refund?.state==='credited'){current={...current,refundState:current.status==='partial'?'partial_credited':(current.status==='refunded'?'refunded':'credited'),refundAmountIQD:refund.totalRefundIQD};try{current=await persistApiOrderUpdate(current);}catch(_) {}}
@@ -4979,9 +5035,13 @@ function issueMathCaptcha(req){
   const now=Date.now();for(const [k,v] of MATH_CAPTCHA_CHALLENGES)if(v.expiresAt<now)MATH_CAPTCHA_CHALLENGES.delete(k);while(MATH_CAPTCHA_CHALLENGES.size>5000)MATH_CAPTCHA_CHALLENGES.delete(MATH_CAPTCHA_CHALLENGES.keys().next().value);
   const a=crypto.randomInt(1,8),b=crypto.randomInt(1,8),captchaId=crypto.randomBytes(18).toString('hex');MATH_CAPTCHA_CHALLENGES.set(captchaId,{answer:String(a+b),ip:clientIp(req),expiresAt:now+5*60*1000});return {captchaId,question:`${a} + ${b} = ؟`};
 }
+  process.on('uncaughtExceptionMonitor',(error,origin)=>{console.error('[PROCESS_UNCAUGHT_EXCEPTION]',String(origin||'uncaughtException'),String(error?.stack||error?.message||error).slice(0,1800));});
+process.on('warning',warning=>{console.warn('[NODE_WARNING]',String(warning?.name||''),String(warning?.message||warning).slice(0,500));});
+let lastRuntimeDiag=Date.now();
+const runtimeDiag=setInterval(()=>{const m=process.memoryUsage();console.log('[RUNTIME_DIAGNOSTIC]',JSON.stringify({uptimeSeconds:Math.floor(process.uptime()),rssMB:Number((m.rss/1048576).toFixed(1)),heapUsedMB:Number((m.heapUsed/1048576).toFixed(1)),heapTotalMB:Number((m.heapTotal/1048576).toFixed(1)),externalMB:Number((m.external/1048576).toFixed(1)),activeHandles:typeof process._getActiveHandles==='function'?process._getActiveHandles().length:undefined,intervalSeconds:Math.round((Date.now()-lastRuntimeDiag)/1000),at:nowISO()}));lastRuntimeDiag=Date.now();},120000);runtimeDiag.unref();
 function consumeMathCaptcha(req,b){
   const id=String(b?.captchaId||''),answer=String(b?.captchaAnswer??'').trim();
-  if(process.env.SADA_NETLIFY_FUNCTION==='true'){
+if(process.env.SADA_NETLIFY_FUNCTION==='true'){
     const now=Date.now();for(const [k,v] of NETLIFY_CAPTCHA_CONSUMED)if(v<now)NETLIFY_CAPTCHA_CONSUMED.delete(k);
     if(!id||id.length>4096)return 'انتهى سؤال التحقق؛ حدّث السؤال وحاول مجدداً.';
     let payload;
@@ -5759,6 +5819,80 @@ async function routeAPI(req,res,urlObj){
       return json(res,200,{ok:true,providerId,providerName:String(prov.name||providerId),providerServiceId,service:{name:String(found.name||('خدمة رقم '+providerServiceId)),description:String(found.description||''),rate:Number(found.rate),min:Math.max(1,Number(found.min||found.minimum||1)||1),max:Math.max(Math.max(1,Number(found.min||found.minimum||1)||1),Number(found.max||found.maximum||1000000)||1000000),refill:!!found.refill,cancel:!!found.cancel,category:String(found.category||found.category_name||found.categoryName||''),rawType:String(found.type||found.service_type||'')},checkedAt:nowISO()});
     }catch(e){return json(res,502,{ok:false,error:'تعذر التحقق من الخدمة لدى المزود: '+String(e.message||e).slice(0,200)});}
   }
+  if(p==='/api/admin/catalog/sections'&&req.method==='GET'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const platform=String(urlObj.searchParams.get('platform')||'').trim();
+    try{
+      await ensureLocalServiceCatalogSeeded();
+      await ensureAdminFreeServicesDurable();
+      const result=catalogSectionIndexForPlatform(platform);
+      if(!result.ok)return json(res,422,{ok:false,error:result.error||'المنصة غير معروفة'});
+      return json(res,200,{ok:true,platform:result.platform,sections:result.sections,source:'firebase-catalog-cache',checkedAt:nowISO()});
+    }catch(e){
+      console.warn('[CATALOG_SECTIONS_READ_FAILED]',String(platform).slice(0,30),String(e.message||e).slice(0,180));
+      return json(res,503,{ok:false,error:'تعذر قراءة أقسام المنصة من Firebase. لم نعرض قائمة فارغة على أنها أقسام غير موجودة. '+String(e.message||e).slice(0,130),retryable:true});
+    }
+  }
+  if(p==='/api/admin/catalog/category-pins'&&req.method==='GET'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const platform=String(urlObj.searchParams.get('platform')||'').trim();
+    try{
+      await ensureLocalServiceCatalogSeeded();await ensureAdminFreeServicesDurable();
+      const result=catalogSectionIndexForPlatform(platform);if(!result.ok)return json(res,422,{ok:false,error:result.error});
+      return json(res,200,{ok:true,platform:result.platform,sections:result.sections,source:'firebase-catalog-cache',checkedAt:nowISO()});
+    }catch(e){return json(res,503,{ok:false,error:'تعذر تحميل أقسام التثبيت من Firebase: '+String(e.message||e).slice(0,160),retryable:true});}
+  }
+  if(p==='/api/admin/catalog/category-pins'&&req.method==='POST'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const b=await bodyJSON(req,256*1024),platform=String(b.platform||'').trim(),pins=Array.isArray(b.pins)?b.pins:[];
+    if(pins.length>500)return json(res,422,{ok:false,error:'عدد الأقسام المحدد يتجاوز الحد المسموح.'});
+    try{
+      await ensureLocalServiceCatalogSeeded();await ensureAdminFreeServicesDurable();
+      const index=catalogSectionIndexForPlatform(platform);if(!index.ok)return json(res,422,{ok:false,error:index.error});
+      const known=new Map(index.sections.map(x=>[normalizeCatalogLabel(x.name),x.name]));const nextPins={},used=new Set();
+      for(const item of pins){
+        const name=String(item?.name||'').trim(),key=normalizeCatalogLabel(name),raw=String(item?.position??'').trim();
+        if(!raw)continue;
+        const position=Number(raw);
+        if(!known.has(key))return json(res,422,{ok:false,error:'القسم «'+name.slice(0,100)+'» غير موجود ضمن المنصة المختارة؛ لم يتم حفظ أي تغيير.'});
+        if(!Number.isInteger(position)||position<1||position>9999)return json(res,422,{ok:false,error:'رقم التثبيت يجب أن يكون عدداً صحيحاً من 1 إلى 9999.'});
+        if(used.has(position))return json(res,422,{ok:false,error:'لا يمكن تثبيت قسمين في الرقم نفسه ('+position+'). اختر رقماً مختلفاً لكل قسم.'});
+        used.add(position);nextPins[known.get(key)]=position;
+      }
+      const remoteOrder=await firebaseGetJson('settings/catalogOrder',12000);
+      const base=remoteOrder&&typeof remoteOrder==='object'&&!Array.isArray(remoteOrder)?remoteOrder:{};
+      const platforms=base.platforms&&typeof base.platforms==='object'&&!Array.isArray(base.platforms)?{...base.platforms}:{};
+      const scoped=platforms[index.platform]&&typeof platforms[index.platform]==='object'&&!Array.isArray(platforms[index.platform])?{...platforms[index.platform]}:{};
+      scoped.pinnedPositions=nextPins;platforms[index.platform]=scoped;
+      const nextOrder={...base,platforms,updatedAt:nowISO(),updatedBy:String(currentSession?.username||ADMIN_USER)};
+      await persistFirebaseCatalogPatch({'settings/catalogOrder':nextOrder},{verify:true,atomic:true,timeoutMs:25000});
+      const cfg=readJSON('catalog_settings.json',{});cfg.catalogOrder=nextOrder;cfg.firebaseCatalogLastVerifiedAt=nowISO();writeJSON('catalog_settings.json',cfg);
+      CATALOG_SNAPSHOT_CACHE.clear();try{purgeCatalogServiceSnapshots()}catch(_){}
+      const verified=await firebaseGetJson('settings/catalogOrder',10000);
+      if(!catalogValuesEqual(verified,nextOrder))throw new Error('حُفظ الترتيب لكن لم تتطابق قراءة التحقق من Firebase.');
+      return json(res,200,{ok:true,verified:true,platform:index.platform,pins:nextPins,sections:catalogSectionIndexForPlatform(index.platform).sections,checkedAt:nowISO()});
+    }catch(e){
+      console.error('[CATEGORY_PINS_SAVE_FAILED]',String(e.message||e).slice(0,200));
+      return json(res,503,{ok:false,error:'لم يتم تأكيد حفظ التثبيتات في Firebase؛ لم نعرض نجاحاً غير مؤكد. '+String(e.message||e).slice(0,150),retryable:true});
+    }
+  }
+  if(p==='/api/order/notify-created'&&req.method==='POST'){
+    if(!currentSession)return json(res,401,{ok:false,error:'سجّل الدخول أولاً.'});
+    const b=await bodyJSON(req,16*1024),firebaseKey=String(b.firebaseKey||'').trim();
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(firebaseKey))return json(res,422,{ok:false,error:'معرّف الطلب المحفوظ غير صالح.'});
+    try{
+      const saved=await firebaseGetJson('orders/'+firebaseKey,10000);
+      if(!saved||typeof saved!=='object'||Array.isArray(saved))return json(res,404,{ok:false,orderSaved:false,error:'لم نعثر على سجل الطلب المحفوظ في Firebase؛ لم نرسل إشعاراً.'});
+      const owner=String(saved.user||saved.username||saved.userName||'').trim().toLowerCase();
+      const actor=String(currentSession.username||'').trim().toLowerCase();
+      if(currentSession.role!=='admin'&&(!owner||owner!==actor))return json(res,403,{ok:false,error:'هذا الطلب لا يتبع الحساب الحالي.'});
+      if(['creating_provider','awaiting_provider','draft','reserved'].includes(String(saved.status||'').toLowerCase()))return json(res,409,{ok:false,orderSaved:true,notificationSent:false,error:'الطلب ما زال قيد تأكيد المزود؛ سيُرسل الإشعار بعد اكتمال حفظه.'});
+      const result=await notifyTelegramNewOrder({...saved,id:String(saved.id||saved.siteOrderId||firebaseKey),siteOrderId:String(saved.siteOrderId||saved.id||firebaseKey),_firebaseKey:firebaseKey},{source:'confirmed-firebase-save'});
+      const sent=!!result.primaryOk;
+      if(!sent)console.warn('[TELEGRAM_ORDER_NOTIFY_FAILED]',JSON.stringify({firebaseKey,username:actor,source:'confirmed-firebase-save',error:String(result.description||result.error||'telegram_not_confirmed').slice(0,180),tokenConfigured:!!telegramConfig().token,chatConfigured:!!telegramConfig().activationChat}));
+      return json(res,200,{ok:true,orderSaved:true,notificationSent:sent,alreadySent:!!result.skipped&&!!result.delivered,description:sent?'تم تأكيد إرسال إشعار الطلب.':String(result.description||result.error||'تم حفظ الطلب، لكن لم يتأكد إرسال إشعار Telegram.'),retryable:!sent});
+    }catch(e){console.warn('[TELEGRAM_ORDER_NOTIFY_ROUTE_ERROR]',String(e.message||e).slice(0,180));return json(res,200,{ok:true,orderSaved:true,notificationSent:false,error:'تم حفظ الطلب، لكن فشل إرسال إشعار Telegram: '+String(e.message||e).slice(0,120),retryable:true});}
+  }
   if(p==='/api/admin/catalog/add-provider-service'&&req.method==='POST'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
     const b=await bodyJSON(req,256*1024);
@@ -5810,14 +5944,10 @@ async function routeAPI(req,res,urlObj){
       const description=String(found.description||found.providerDescription||providerServiceDescription(found)||'').trim().slice(0,5000);
       const at=nowISO();
       const serviceRow={...(existingRow||{}),key:serviceKey,fbKey:serviceKey,name:serviceName,app:apps[0]||platform,apps,platforms:apps,serviceApp:platform,servicePlatform:platform,platformsExplicit:true,groups:mergedGroups,categories:mergedGroups,category:mergedGroups[0]||categories[0],providerId,providerName:String(prov.name||providerId),providerServiceId,smmpartyId:providerServiceId,serviceId:providerServiceId,source:'smmparty',sourceProviderId:providerId,providerRateUsd:baseRate,smmRateUsd:baseRate,smmRate:baseRate,sellingUsd,rateUsd:sellingUsd,markupPct,basePrice:Number((baseRate*FIXED_RATE).toFixed(4)),price:Number((sellingUsd*FIXED_RATE).toFixed(4)),min:Math.max(1,Math.floor(Number(found.min||found.minimum||1)||1)),max:Math.max(Math.max(1,Math.floor(Number(found.min||found.minimum||1)||1)),Math.floor(Number(found.max||found.maximum||1000000)||1000000)),desc:description,description,providerDescription:description,refill:!!found.refill,cancel:!!found.cancel,quality:String(found.rawType||found.type||'SMM'),active:existingRow?.active!==false,enabled:existingRow?.enabled!==false,deleted:false,createdAt:existingRow?.createdAt||at,updatedAt:at,updatedBy:String(currentSession?.username||ADMIN_USER)};
-      const metaRoot=catalogObject(readJSON('category_meta.json',{}));
       const labelIdentity=value=>normalizeCatalogLabel(value).normalize('NFKC').replace(/[أإآٱ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه').replace(/[\s._-]+/g,'');
-      const platformAliases={Instagram:['instagram','insta','انستغرام','انستجرام','انستقرام','انستا'],Tiktok:['tiktok','تيكتوك','تيك توك'],Youtube:['youtube','يوتيوب'],Facebook:['facebook','فيسبوك','فيس بوك','فيس'],Telegram:['telegram','تلجرام','تيليجرام','تليجرام','تلغرام'],Twitter:['twitter','تويتر','x','xcom'],Snapchat:['snapchat','سناب','سنابشات','سناب شات'],Whatsapp:['whatsapp','واتساب','واتس اب'],Linkedin:['linkedin','لينكدان','لينكدإن'],Other:['other','اخرى','عام']};
-      const isTargetPlatform=value=>{const v=labelIdentity(value);return (platformAliases[platform]||[]).some(a=>{const k=labelIdentity(a);return v===k||v.includes(k)});};
-      const knownForPlatform=new Map();
-      for(const m of Object.values(metaRoot)){if(!m||typeof m!=='object')continue;const name=String(m.name||'').trim();if(!name)continue;const ps=[...(Array.isArray(m.platforms)?m.platforms:[]),m.platform,m.imagePlatform].filter(Boolean);if(!ps.length||ps.some(isTargetPlatform))knownForPlatform.set(labelIdentity(name),name);}
-      const rowHasPlatform=(row)=>{const vals=[];for(const k of ['apps','platforms','app','platform','serviceApp','servicePlatform','network','site']){const v=row?.[k];if(Array.isArray(v))vals.push(...v);else if(v)vals.push(v);}if(vals.length)return vals.some(isTargetPlatform);return catalogRowGroups(row).some(group=>{const meta=Object.values(metaRoot).find(m=>labelIdentity(m?.name||'')===labelIdentity(group));const ps=[...(Array.isArray(meta?.platforms)?meta.platforms:[]),meta?.platform,meta?.imagePlatform].filter(Boolean);return ps.some(isTargetPlatform);});};
-      for(const row of Object.values(servicesRoot)){if(!row||typeof row!=='object'||row.deleted===true||!rowHasPlatform(row))continue;for(const group of catalogRowGroups(row))knownForPlatform.set(labelIdentity(group),group);}
+      const platformSections=catalogSectionIndexForPlatform(platform);
+      if(!platformSections.ok)return json(res,422,{ok:false,error:platformSections.error||'المنصة غير معروفة.'});
+      const knownForPlatform=new Map(platformSections.sections.map(section=>[labelIdentity(section.name),section.name]));
       if(categoryMode==='existing'){
         const missing=categories.filter(name=>!knownForPlatform.has(labelIdentity(name)));
         if(missing.length)return json(res,422,{ok:false,error:'الأقسام التالية غير موجودة في المنصة المحددة: '+missing.join('، ')+'. اختر «إنشاء قسم جديد» إذا كنت تريد إنشاءها.'});
@@ -8149,7 +8279,7 @@ async function routeAPI(req,res,urlObj){
       resolvedSiteOrderId=String(financialOrder.id||financialOrder.siteOrderId||effectiveSiteOrderId||'');
       const synced=await syncVerifiedOrderStatus(financialOrder,d,normalized);
       if(!synced.ok)return json(res,503,{ok:false,error:'تم فحص حالة المزود لكن تعذر حفظها والتحقق منها في قاعدة البيانات. لم نغيّر الرصيد.',details:synced.error||synced.refund?.error||synced.refund?.reason});
-      return json(res,200,{ok:true,siteOrderId:resolvedSiteOrderId,providerId,providerOrderId,status:String(synced.order?.status||normalized),providerStatus:String(synced.order?.providerStatus||rawProviderStatus||normalized),providerStatusConfirmed:true,normalizedStatus:normalized,remains:synced.order?.remains??null,startCount:synced.order?.startCount??null,endCount:synced.order?.endCount??null,charge:d.charge,currency:d.currency||'USD',refund:synced?.refund||null,checkedAt:synced.checkedAt||checkedAt});
+      return json(res,200,{ok:true,siteOrderId:resolvedSiteOrderId,providerId,providerOrderId,status:String(synced.order?.status||normalized),providerStatus:String(synced.order?.providerStatus||rawProviderStatus||normalized),providerStatusConfirmed:true,normalizedStatus:normalized,remains:d.remains??d?.data?.remains??null,startCount:d.start_count??d.startCount??null,charge:d.charge,currency:d.currency||'USD',refund:synced?.refund||null,checkedAt:synced.checkedAt||checkedAt});
     }catch(e){return json(res,502,{ok:false,error:e.name==='AbortError'?'انتهت مهلة الاتصال بالمزود':e.message});}
   }
   if(p==='/api/order/cancel' && req.method==='POST'){
@@ -8288,7 +8418,7 @@ async function routeAPI(req,res,urlObj){
       const resolvedOrder=await resolveFinancialOrder({...order,providerId,providerOrderId,_firebaseKey:order._firebaseKey||order.firebaseKey||''});
       const synced=await syncVerifiedOrderStatus(resolvedOrder,d,normalized);
       if(!synced.ok)return json(res,503,{ok:false,error:'تم فحص المزود لكن تعذر تثبيت الحالة والتحقق من حفظها في قاعدة البيانات؛ لم يُنفذ الاسترداد.',details:synced.error||synced.refund?.error||synced.refund?.reason});
-      return json(res,200,{ok:true,siteOrderId:String(synced.order?.id||synced.order?.siteOrderId||siteId),providerOrderId,status:synced.order.status,providerStatus:synced.order.providerStatus,providerStatusConfirmed:synced.order.providerStatusConfirmed,remains:synced.order.remains,startCount:synced.order.startCount,endCount:synced.order.endCount,refund:synced.refund||null,checkedAt:synced.order.lastCheckedAt});
+      return json(res,200,{ok:true,siteOrderId:String(synced.order?.id||synced.order?.siteOrderId||siteId),providerOrderId,status:synced.order.status,providerStatus:synced.order.providerStatus,providerStatusConfirmed:synced.order.providerStatusConfirmed,remains:synced.order.remains,startCount:synced.order.startCount,refund:synced.refund||null,checkedAt:synced.order.lastCheckedAt});
     }catch(e){
       appendJsonLedger('provider_failures.json',{stage:'admin_order_status',siteOrderId:siteId,providerId,providerOrderId,error:String(e.message||e),createdAt:nowISO()});
       return json(res,502,{ok:false,error:String(e.message||e)});
@@ -8907,6 +9037,10 @@ const server=http.createServer(async (req,res)=>{
     res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=()');
     if(res._forwardedProto==='https') res.setHeader('Strict-Transport-Security','max-age=15552000; includeSubDomains');
     const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
+    if(u.pathname==='/healthz'&&req.method==='GET'){
+      const mem=process.memoryUsage();
+      return json(res,200,{ok:true,status:'ready',version:APP_VERSION,buildId:BUILD_ID,uptimeSeconds:Math.floor(process.uptime()),memory:{rssMB:Number((mem.rss/1048576).toFixed(1)),heapUsedMB:Number((mem.heapUsed/1048576).toFixed(1))},checkedAt:nowISO()});
+    }
     res._acceptEncoding=String(req.headers['accept-encoding']||'');
     // Never compress authentication/session or Telegram secret-management responses.
     res._allowJsonCompression=!(/^\/api\/auth(?:\/|$)/i.test(u.pathname)||/^\/api\/admin\/telegram(?:\/|$)/i.test(u.pathname));
@@ -8923,6 +9057,17 @@ const server=http.createServer(async (req,res)=>{
     return json(res,st,{error:st===500?'Server error':e.message});
   }
 });
+let SHUTDOWN_STARTED=false;
+function gracefulServerShutdown(signal){
+  if(SHUTDOWN_STARTED)return;
+  SHUTDOWN_STARTED=true;
+  console.log('[PROCESS_SIGNAL] '+signal+' received; starting graceful HTTP shutdown.');
+  const forceTimer=setTimeout(()=>{console.error('[PROCESS_SHUTDOWN_TIMEOUT] active HTTP connections did not drain within 12s; forcing close.');try{server.closeAllConnections?.();}catch(_){}process.exit(1);},12000);
+  server.close(error=>{clearTimeout(forceTimer);if(error){console.error('[PROCESS_SHUTDOWN_ERROR]',String(error.message||error).slice(0,300));process.exit(1);}console.log('[PROCESS_SHUTDOWN_COMPLETE] HTTP server closed.');process.exit(0);});
+  try{server.closeIdleConnections?.();}catch(_){}
+}
+process.once('SIGTERM',()=>gracefulServerShutdown('SIGTERM'));
+process.once('SIGINT',()=>gracefulServerShutdown('SIGINT'));
 if(process.env.SADA_NETLIFY_FUNCTION==='true'){
   // Netlify Functions invoke this HTTP server through serverless-http; never open a long-lived port.
   server.sadaReady=Promise.allSettled([hydrateProviderRuntimeFromFirebase(),hydrateTelegramChannelsFromFirebase(),hydrateApiServicesFromFirebase()]);
@@ -8939,8 +9084,7 @@ if(process.env.SADA_NETLIFY_FUNCTION==='true'){
     // The bundled Base44 dump was removed from this release. Only the explicitly configured Firebase is used.
     if(process.env.NODE_ENV!=='test'){
       setTimeout(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},3000).unref();
-      setInterval(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},60*1000).unref();
-      setInterval(()=>{runRefundReconciliationMonitor().catch(()=>{});},15*1000).unref();
+      setInterval(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},60*1000).unref();
     }
   });
 });
