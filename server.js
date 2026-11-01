@@ -45,7 +45,7 @@ function purgeCatalogServiceSnapshots(){
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
 const APP_VERSION = '3.2';
-const BUILD_ID = 'SADA-3.2-R13-ABSOLUTE-PINS-ORDER-TELEGRAM-RAILWAY-STABILITY-20261101';
+const BUILD_ID = 'SADA-3.2-R13.1-PROVIDER-ADD-METAROOT-HOTFIX-20261102';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -5923,6 +5923,9 @@ async function routeAPI(req,res,urlObj){
       await ensureAdminFreeServicesDurable();
       ensureNumericSiteServiceIds();
       const servicesRoot=catalogObject(readJSON('services.json',{}));
+      // The provider-add route writes section metadata below; load the canonical metadata root
+      // after catalog hydration so existing section image/platform/service links are preserved.
+      const metaRoot=catalogObject(readJSON('category_meta.json',{}));
       let existingKey='',existingRow=null;
       for(const [key,row] of Object.entries(servicesRoot)){
         if(!row||typeof row!=='object')continue;

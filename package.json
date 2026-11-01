@@ -14,7 +14,7 @@
   "engines": {
     "node": ">=22"
   },
-  "buildId": "SADA-3.2-R13-ABSOLUTE-PINS-ORDER-TELEGRAM-RAILWAY-STABILITY-20261101",
+  "buildId": "SADA-3.2-R13.1-PROVIDER-ADD-METAROOT-HOTFIX-20261102",
   "dependencies": {
     "google-auth-library": "^11.2.0",
     "firebase-admin": "^14.5.0"
