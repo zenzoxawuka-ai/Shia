@@ -45,7 +45,7 @@ function purgeCatalogServiceSnapshots(){
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
 const APP_VERSION = '3.2';
-const BUILD_ID = 'SADA-3.2-ORDER-STATUS-4S-ADMIN-ALERTS-SORT-PAGING-20261101-R13';
+const BUILD_ID = 'SADA-3.2-MEMORY-RECOVERY-4S-PAGED-REAL-STATUS-20261101-R14';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -678,29 +678,35 @@ function catalogApplyBatch(updates){
   const cfg=readJSON('catalog_settings.json',{});if(cfg.catalogOrder){const normalized=canonicalCatalogOrder(cfg.catalogOrder,readJSON('category_meta.json',{}));if(JSON.stringify(normalized)!==JSON.stringify(cfg.catalogOrder)){cfg.catalogOrder=normalized;writeJSON('catalog_settings.json',cfg);}}
   return {ok:true,count:entries.length,storage:'hosting-json'};
 }
+const MAX_JSON_RESPONSE_BYTES = Math.max(4, Math.min(16, Number(process.env.SADA_MAX_JSON_RESPONSE_MB)||8)) * 1024 * 1024;
 function json(res, status, obj, extra={}) {
   res.statusCode = status;
   res.setHeader('Content-Type','application/json; charset=utf-8');
   res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, max-age=0');
   for (const [k,v] of Object.entries(extra)) res.setHeader(k,v);
-  const raw=Buffer.from(JSON.stringify(obj));
-  let body=raw, encoding='';
-  // Compress larger API lists (users/orders/services) to avoid slow mobile downloads.
-  // Auth/session and secret-bearing endpoints opt out in the request dispatcher.
-  if(res._allowJsonCompression!==false && raw.length>=2048){
-    const ae=String(res._acceptEncoding||'');
+  let text;
+  try { text=JSON.stringify(obj); } catch (_) { status=500;res.statusCode=500;text='{"ok":false,"error":"تعذرت صياغة استجابة الخادم."}'; }
+  if(typeof text!=='string')text='null';
+  const length=Buffer.byteLength(text,'utf8');
+  if(length>MAX_JSON_RESPONSE_BYTES){
+    res.statusCode=503;
+    const safe='{"ok":false,"code":"response_too_large","error":"البيانات المطلوبة كبيرة جداً لعرضها دفعة واحدة. استخدم البحث أو التقسيم إلى صفحات."}';
+    res.setHeader('Content-Length',String(Buffer.byteLength(safe)));res.setHeader('Vary','Accept-Encoding');return res.end(safe);
+  }
+  const ae=String(res._acceptEncoding||'');
+  const canCompress=res._allowJsonCompression!==false&&length>=4096&&length<=2*1024*1024;
+  if(canCompress){
+    const raw=Buffer.from(text,'utf8');let body=raw,encoding='';
     try{
       if(/(?:^|,\s*)br(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(ae)){
-        body=zlib.brotliCompressSync(raw,{params:{[zlib.constants.BROTLI_PARAM_QUALITY]:4}});encoding='br';
+        body=zlib.brotliCompressSync(raw,{params:{[zlib.constants.BROTLI_PARAM_QUALITY]:3}});encoding='br';
       }else if(/(?:^|,\s*)gzip(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(ae)){
-        body=zlib.gzipSync(raw,{level:6});encoding='gzip';
+        body=zlib.gzipSync(raw,{level:4});encoding='gzip';
       }
     }catch(_){body=raw;encoding='';}
+    res.setHeader('Vary','Accept-Encoding');if(encoding)res.setHeader('Content-Encoding',encoding);res.setHeader('Content-Length',String(body.length));return res.end(body);
   }
-  res.setHeader('Vary','Accept-Encoding');
-  if(encoding)res.setHeader('Content-Encoding',encoding);
-  res.setHeader('Content-Length',String(body.length));
-  res.end(body);
+  res.setHeader('Vary','Accept-Encoding');res.setHeader('Content-Length',String(length));res.end(text);
 }
 function parseCookies(req){
   const out={};
@@ -1777,9 +1783,12 @@ async function ensurePublicOrderCounter(){
     // One-time migration only: seed a compact Firebase counter from legacy order records.
     // All subsequent page loads and new orders use the one-number counter node, not the orders root.
     if(cfg.publicOrderCounterInitialized!==true){
-      let legacy;
-      try{legacy=await firebaseGetJson('orders',15000);}catch(e){throw new Error('تعذر تهيئة عدّاد الطلبات بأمان؛ لم ننشئ رقماً قد يتكرر. '+String(e.message||e).slice(0,100));}
-      seed=Math.max(seed,maxPublicOrderNumberFromRows(legacy));
+      // Scan Firebase in bounded pages. If the safety cap is reached, refuse initialization
+      // rather than loading the full orders root or risking duplicate public order numbers.
+      let aggregate;
+      try{aggregate=await getFirebaseOrderAggregates(true);}catch(e){throw new Error('تعذر فحص سجل الطلبات لتهيئة العداد بأمان؛ لم ننشئ رقماً قد يتكرر. '+String(e.message||e).slice(0,100));}
+      if(!aggregate.complete)throw new Error('تجاوز سجل الطلبات الحد الآمن للفحص المرحلي؛ لم يتم تهيئة العداد حتى لا يتكرر رقم طلب. يلزم فحص إضافي مجزأ.');
+      seed=Math.max(seed,Number(aggregate.latestPublicOrderNo||0));
     }
     const tx=await firebaseTransaction(counterPath,current=>{
       const currentNo=publicOrderCounterNumber(current);
@@ -2426,22 +2435,20 @@ function isMissingFirebaseIndexError(error){
 }
 async function firebaseGetUserOrders(username,timeoutMs=8000){
   const owner=String(username||'').trim();
-  if(!owner)return {data:{},source:'firebase-indexed'};
-  if(!firebaseOrdersUserIndexMissing){
-    try{
-      const data=await firebaseGetQueryJson('orders',{orderBy:JSON.stringify('user'),equalTo:JSON.stringify(owner)},timeoutMs);
-      return {data,source:'firebase-indexed'};
-    }catch(error){
-      if(!isMissingFirebaseIndexError(error))throw error;
+  if(!owner)return {data:{},source:'firebase-indexed',bounded:true};
+  if(firebaseOrdersUserIndexMissing){const error=new Error('فهرس user غير مفعل في Firebase. حدّث database.rules.json ثم أعد تشغيل الخدمة؛ لم يتم تنزيل قاعدة الطلبات كاملة.');error.code='firebase_user_index_required';throw error;}
+  try{
+    // Always keep the user's history bounded. The UI itself renders at most 500 records.
+    const data=await firebaseGetQueryJson('orders',{orderBy:JSON.stringify('user'),equalTo:JSON.stringify(owner),limitToLast:500},timeoutMs);
+    return {data,source:'firebase-indexed',bounded:true};
+  }catch(error){
+    if(isMissingFirebaseIndexError(error)){
       firebaseOrdersUserIndexMissing=true;
-      console.warn('Firebase /orders is missing the user index; using the temporary owner-filtered fallback. Deploy database.rules.json to restore indexed reads.');
+      console.error('Firebase /orders is missing the user index. Full-root fallback disabled to protect Railway memory. Deploy database.rules.json.');
+      const missing=new Error('فهرس user غير مفعل في Firebase. حدّث قواعد database.rules.json التي تتضمن .indexOn: ["user"] ثم أعد تشغيل الخدمة. لم يتم تحميل كل الطلبات لتجنب استهلاك الذاكرة.');missing.code='firebase_user_index_required';throw missing;
     }
+    throw error;
   }
-  // Service-account server read only; callers below filter by the authenticated username before
-  // returning anything. This is a resilience fallback, not a replacement for deploying the index.
-  const all=await firebaseGetJson('orders',timeoutMs);
-  const ownEntries=collectionEntries(all).filter(([,order])=>order&&typeof order==='object'&&!Array.isArray(order)&&String(order.user||order.username||order.userName||'')===owner);
-  return {data:Object.fromEntries(ownEntries),source:'firebase-index-fallback'};
 }
 async function firebaseWriteJson(pathname,value,timeoutMs=8000){
   if(firebaseAdminEnabled()){
@@ -2572,12 +2579,12 @@ function auditNormalizeRecord(order={},source='firebase',sourceKey=''){
     status:auditStatus(rawStatus),rawStatus:rawStatus||'غير مسجلة',providerStatus:rawProviderStatus,providerStatusConfirmed,createdAt:o.createdAt||o.created_at||o.timestamp||o.date||null,createdMs,
     providerName:String(o.providerName||o.provider||o.smmProviderName||'').trim(),providerId:String(o.providerId||o.provider_id||o.smmProviderId||'').trim(),providerOrderId,
     amountIQD:Number(o.totalIQD??o.totalIqd??o.total_iqd??o.amountIQD??o.amountIqd??o.chargeIQD??o.chargeIqd??o.priceIQD??o.priceIqd??o.amount??NaN),
-    lastCheckedAt:o.lastCheckedAt||o.lastChecked||o.providerCheckedAt||null,
+    lastCheckedAt:o.lastCheckedAt||o.lastChecked||o.providerCheckedAt||null,statusSyncLastAttemptAt:o.statusSyncLastAttemptAt||o.lastCheckedAt||o.lastChecked||null,
     updatedAt:o.updatedAt||o.updated_at||o.lastUpdatedAt||null,
     completedAt:o.completedAt||o.completed_at||o.finishedAt||null,
     cancelledAt:o.cancelledAt||o.cancelled_at||o.cancelAt||null,
     cancelReason:String(o.cancelReason||o.cancellationReason||o.failureReason||o.reason||''),
-    remains:o.remains??null,startCount:o.startCount??o.start_count??null,refundState:String(o.refundState||''),refundAmountIQD:Number(o.refundAmountIQD||0),
+    remains:o.remains??null,startCount:o.startCount??o.start_count??null,actualAfterCount:o.actualAfterCount??o.actual_after_count??null,actualAfterCountSource:String(o.actualAfterCountSource||''),actualAfterCountVerifiedAt:o.actualAfterCountVerifiedAt||null,refundState:String(o.refundState||''),refundAmountIQD:Number(o.refundAmountIQD||0),
     source, firebaseKey:source==='firebase'?String(sourceKey||''):'',
     legacyHistory:!!o.legacyHistory, readOnly:!!o.readOnly,
     siteLocalId:source==='server'?String(id||''):'',
@@ -2600,33 +2607,16 @@ function auditIdentity(row){
   return String(row.source||'')+':'+String(row.firebaseKey||row.createdMs||'')+'|u:'+u;
 }
 async function loadOrderAuditSnapshot(force=false){
-  const now=Date.now();if(!force&&ORDER_AUDIT_SNAPSHOT_CACHE.loaded&&now-ORDER_AUDIT_SNAPSHOT_CACHE.at<8000)return ORDER_AUDIT_SNAPSHOT_CACHE;
-  const remote=await Promise.allSettled([firebaseGetJson('orders',14000)]);
-  const fbOk=remote[0].status==='fulfilled';const fbRoot=fbOk?remote[0].value:null;
-  const fbError=fbOk?'':String(remote[0].reason?.message||'تعذر قراءة Firebase').slice(0,180);
-  const rawFirebase=[];
-  if(fbOk&&fbRoot&&typeof fbRoot==='object'){
-    const entries=Array.isArray(fbRoot)?fbRoot.map((v,i)=>[String(i),v]):Object.entries(fbRoot);
-    for(const [key,o] of entries){if(!o||typeof o!=='object'||Array.isArray(o)||o.event)continue;const row=auditNormalizeRecord(o,'firebase',key);if(row.id||row.providerOrderId||row.createdMs)rawFirebase.push(row);}
-  }
-  const local=readJSON('orders.json',[]);const rawLocal=[];
-  if(Array.isArray(local))for(const o of local){if(!o||typeof o!=='object'||o.event)continue;const row=auditNormalizeRecord(o,'server',String(o.id||''));if(row.id||row.providerOrderId||row.createdMs)rawLocal.push(row);}
-  const merged=new Map();
-  // Firebase order records are preferred for current status. Add local-ledger-only fields only if missing.
-  for(const row of [...rawFirebase,...rawLocal]){
-    const key=auditIdentity(row);const prior=merged.get(key);
-    if(!prior){merged.set(key,{...row,_auditSources:[row.source],_firebaseKey:row.firebaseKey||'',_serverOrderId:row.siteLocalId||''});continue;}
-    const incomingIsFirebase=row.source==='firebase';const winner=incomingIsFirebase?{...prior,...row}:{...row,...prior};
-    for(const [field,value] of Object.entries(row))if((winner[field]===undefined||winner[field]===null||winner[field]===''||winner[field]==='unknown')&&value!==undefined&&value!==null&&value!=='')winner[field]=value;
-    winner._auditSources=[...new Set([...(prior._auditSources||[]),row.source])];
-    winner._firebaseKey=prior._firebaseKey||row.firebaseKey||'';winner._serverOrderId=prior._serverOrderId||row.siteLocalId||'';
-    merged.set(key,winner);
-  }
-  const providers=providerStore().providers||{};
-  const rows=[...merged.values()].map(row=>({...row,providerName:row.providerName||(providers[row.providerId]?.name||''),status:auditStatus(row.status||row.rawStatus)}));
-  ORDER_AUDIT_SNAPSHOT_CACHE={at:now,rows,firebaseAvailable:fbOk,firebaseError:fbError,loaded:true};
+  const now=Date.now();
+  if(!force&&ORDER_AUDIT_SNAPSHOT_CACHE.loaded&&now-ORDER_AUDIT_SNAPSHOT_CACHE.at<8000)return ORDER_AUDIT_SNAPSHOT_CACHE;
+  // Never download the entire Firebase orders root into the web process heap.
+  // Reuse the bounded/indexed snapshot shared by the provider and overdue monitors.
+  const bounded=await loadOrderMonitorSnapshot();
+  const rows=Array.isArray(bounded.rows)?bounded.rows.map(row=>({...row})):[];
+  ORDER_AUDIT_SNAPSHOT_CACHE={at:now,rows,firebaseAvailable:!!bounded.firebaseAvailable,firebaseError:String(bounded.firebaseError||''),loaded:true,bounded:true,queryCount:Number(bounded.queryCount||0)};
   return ORDER_AUDIT_SNAPSHOT_CACHE;
 }
+
 // Background monitors share one bounded snapshot. Rather than downloading the whole orders node,
 // read the latest 500 orders and indexed active/refund-relevant statuses only.
 let ORDER_MONITOR_SNAPSHOT_AT=0;
@@ -2634,11 +2624,11 @@ let ORDER_MONITOR_SNAPSHOT_VALUE=null;
 let ORDER_MONITOR_SNAPSHOT_PROMISE=null;
 async function loadOrderMonitorSnapshot(){
   const now=Date.now();
-  if(ORDER_MONITOR_SNAPSHOT_VALUE&&now-ORDER_MONITOR_SNAPSHOT_AT<55_000)return ORDER_MONITOR_SNAPSHOT_VALUE;
+  if(ORDER_MONITOR_SNAPSHOT_VALUE&&now-ORDER_MONITOR_SNAPSHOT_AT<15_000)return ORDER_MONITOR_SNAPSHOT_VALUE;
   if(ORDER_MONITOR_SNAPSHOT_PROMISE)return ORDER_MONITOR_SNAPSHOT_PROMISE;
   ORDER_MONITOR_SNAPSHOT_PROMISE=(async()=>{
-    const statuses=['pending','processing','in progress','in_progress','creating_provider','provider_pending','partial','partially completed','cancelled','canceled','ملغي','ملغى','قيد الانتظار','قيد التنفيذ'];
-    const jobs=[firebaseGetQueryJson('orders',{orderBy:'\"$key\"',limitToLast:500},10000),...statuses.map(status=>firebaseGetQueryJson('orders',{orderBy:'\"status\"',equalTo:JSON.stringify(status),limitToLast:500},10000))];
+    const statuses=['pending','processing','in progress','in_progress','creating_provider','provider_pending','partial','cancelled','failed','refunded'];
+    const jobs=[firebaseGetQueryJson('orders',{orderBy:'"$key"',limitToLast:300},8000),...statuses.map(status=>firebaseGetQueryJson('orders',{orderBy:'"status"',equalTo:JSON.stringify(status),limitToLast:80},8000))];
     const settled=await Promise.allSettled(jobs),raw=new Map();let successes=0;const errors=[];
     settled.forEach((result,index)=>{
       if(result.status!=='fulfilled'){errors.push(String(result.reason?.message||'تعذر تحميل جزء من الطلبات').slice(0,100));return;}
@@ -2661,7 +2651,7 @@ async function loadOrderMonitorSnapshot(){
 }
 function auditPublicRecord(row,now=Date.now(),delayHours=3){
   const createdMs=Number(row.createdMs||auditOrderTime(row)||0)||null;const ageMs=createdMs?Math.max(0,now-createdMs):null;const status=auditStatus(row.status||row.rawStatus);
-  return {id:String(row.id||''),siteOrderId:String(row.siteOrderId||row.id||''),publicOrderNo:String((/^\d{1,9}$/.test(String(row.publicOrderNo||''))&&Number(row.publicOrderNo)>=3000)?row.publicOrderNo:(/^\d{1,9}$/.test(String(row.id||''))&&Number(row.id)>=3000?row.id:'')),user:String(row.user||''),userName:String(row.userName||row.user||'—'),email:String(row.email||''),serviceName:String(row.serviceName||'خدمة'),serviceId:String(row.serviceId||''),platform:String(row.platform||auditPlatform(row)),serviceApp:String(row.serviceApp||''),link:String(row.link||''),quantity:Number(row.quantity||0),status,rawStatus:String(row.rawStatus||status),createdAt:row.createdAt||null,createdMs,ageMs,overdue:!row.legacyHistory&&!!(ageMs!==null&&ageMs>delayHours*3600000&&!auditTerminalStatus(status)),providerName:String(row.providerName||'—'),providerId:String(row.providerId||''),providerOrderId:String(row.providerOrderId||''),lastCheckedAt:row.lastCheckedAt||null,updatedAt:row.updatedAt||null,completedAt:row.completedAt||null,cancelledAt:row.cancelledAt||null,cancelReason:String(row.cancelReason||''),remains:row.remains??null,startCount:row.startCount??null,amountUsd:Number.isFinite(row.amountUsd)?row.amountUsd:null,source:String(row.source||''),sourceKey:String(row._firebaseKey||row.firebaseKey||''),legacyHistory:!!row.legacyHistory,readOnly:!!row.legacyHistory||!!row.readOnly,sources:Array.isArray(row._auditSources)?row._auditSources:[row.source].filter(Boolean)};
+  return {id:String(row.id||''),siteOrderId:String(row.siteOrderId||row.id||''),publicOrderNo:String((/^\d{1,9}$/.test(String(row.publicOrderNo||''))&&Number(row.publicOrderNo)>=3000)?row.publicOrderNo:(/^\d{1,9}$/.test(String(row.id||''))&&Number(row.id)>=3000?row.id:'')),user:String(row.user||''),userName:String(row.userName||row.user||'—'),email:String(row.email||''),serviceName:String(row.serviceName||'خدمة'),serviceId:String(row.serviceId||''),platform:String(row.platform||auditPlatform(row)),serviceApp:String(row.serviceApp||''),link:String(row.link||''),quantity:Number(row.quantity||0),status,rawStatus:String(row.rawStatus||status),createdAt:row.createdAt||null,createdMs,ageMs,overdue:!row.legacyHistory&&!!(ageMs!==null&&ageMs>delayHours*3600000&&!auditTerminalStatus(status)),providerName:String(row.providerName||'—'),providerId:String(row.providerId||''),providerOrderId:String(row.providerOrderId||''),lastCheckedAt:row.lastCheckedAt||null,updatedAt:row.updatedAt||null,completedAt:row.completedAt||null,cancelledAt:row.cancelledAt||null,cancelReason:String(row.cancelReason||''),remains:row.remains??null,startCount:row.startCount??null,actualAfterCount:row.actualAfterCount??null,actualAfterCountSource:String(row.actualAfterCountSource||''),actualAfterCountVerifiedAt:row.actualAfterCountVerifiedAt||null,amountUsd:Number.isFinite(row.amountUsd)?row.amountUsd:null,source:String(row.source||''),sourceKey:String(row._firebaseKey||row.firebaseKey||''),legacyHistory:!!row.legacyHistory,readOnly:!!row.legacyHistory||!!row.readOnly,sources:Array.isArray(row._auditSources)?row._auditSources:[row.source].filter(Boolean)};
 }
 function auditPageFilter(rows,params,settings){
   const now=Date.now(),delayMs=settings.delayHours*3600000;
@@ -2907,6 +2897,18 @@ async function applyVerifiedOrderRefund(inputOrder={},providerData={},normalized
   const responseState=settledState!=='credited'?settledState:(status==='partial'&&finalTotal>0?'partial_credited':(status==='refunded'?'refunded':'credited'));
   return {ok:true,credited:!!result.credited,state:responseState,amountIQD:Number(result.deltaIQD||0),totalRefundIQD:finalTotal,balanceIQD:Number(result.balanceIQD??transaction.value?.balance??0),currency:'IQD',reason:result.reason||''};
 }
+function extractExplicitProviderAfterCount(data){
+  const keys=['actual_after_count','actualAfterCount','after_count','afterCount','count_after','countAfter'];
+  const containers=['data','result','response','order','details','payload'];
+  const queue=[data],seen=new Set();let visited=0;
+  while(queue.length&&visited++<40){const node=queue.shift();if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);
+    if(Array.isArray(node)){for(const item of node.slice(0,8))if(item&&typeof item==='object')queue.push(item);continue;}
+    for(const key of keys){const value=node[key];if(value===undefined||value===null||String(value).trim()==='')continue;const number=Number(value);if(Number.isFinite(number)&&number>=0&&number<=1_000_000_000)return number;}
+    for(const key of containers){const value=node[key];if(value&&typeof value==='object')queue.push(value);}
+  }
+  return null;
+}
+
 async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
   const rawStatus=extractProviderStatus(providerData);
   const normalized=normalizeProviderStatus(normalizedStatus||rawStatus);
@@ -2918,7 +2920,11 @@ async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
   const providerRemains=providerData?.remains??providerData?.remaining??providerData?.data?.remains??providerData?.data?.remaining??providerData?.result?.remains??providerData?.result?.remaining;
   if(providerRemains!==undefined)update.remains=providerRemains;
   const providerStartCount=providerData?.start_count??providerData?.startCount??providerData?.data?.start_count??providerData?.data?.startCount??providerData?.result?.start_count??providerData?.result?.startCount;
-  if(providerStartCount!==undefined)update.startCount=providerStartCount;
+  // Preserve the first captured baseline. A later status poll must not rewrite the count from order creation.
+  const existingStart=full.startCount??full.start_count;
+  if((existingStart===undefined||existingStart===null||String(existingStart).trim()==='')&&providerStartCount!==undefined)update.startCount=providerStartCount;
+  const actualAfterCount=extractExplicitProviderAfterCount(providerData);
+  if(actualAfterCount!==null){update.actualAfterCount=actualAfterCount;update.actualAfterCountSource='provider-response';update.actualAfterCountVerifiedAt=checkedAt;}
 
   const fbKey=String(full._firebaseKey||full.firebaseKey||'').trim();
   // Do not credit a wallet until the provider-confirmed status is durably attached to the canonical Firebase order.
@@ -3102,9 +3108,46 @@ async function runRefundReconciliationMonitor(){
   if(runRefundReconciliationMonitor.running)return;runRefundReconciliationMonitor.running=true;
   try{
     const snapshot=await loadOrderMonitorSnapshot();if(!snapshot.rows?.length)return;const now=Date.now();let examined=0;
-    const candidates=snapshot.rows.filter(r=>r.providerId&&r.providerOrderId&&(['pending','processing'].includes(r.status)||(['cancelled','partial','failed','refunded'].includes(r.status)&&!['credited','partial_credited','refunded','no_refund_due'].includes(String(r.refundState||''))))&&(!r.lastCheckedAt||now-(auditTimestamp(r.lastCheckedAt)||0)>30000)).sort((a,b)=>Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,12);
-    for(const row of candidates){if(examined++>=12)break;try{const full=await resolveFinancialOrder(row);await ensureProviderRuntime(row.providerId);const prov=getProviderById(row.providerId,{allowSingleFallback:false}).prov;if(!prov?.url||!prov?.key)continue;const d=await providerRequest(prov,{action:'status',order:String(row.providerOrderId)},15000);const normalized=normalizeProviderStatus(extractProviderStatus(d));if(normalized==='unknown')continue;await syncVerifiedOrderStatus(full,d,normalized);}catch(e){console.warn('refund/order status monitor:',String(e.message||e).slice(0,120));}}
+    const candidates=snapshot.rows.filter(r=>r.providerId&&r.providerOrderId&&['cancelled','partial','failed','refunded'].includes(r.status)&&!['credited','partial_credited','refunded','no_refund_due'].includes(String(r.refundState||''))&&(!r.lastCheckedAt||now-(auditTimestamp(r.lastCheckedAt)||0)>30000)).sort((a,b)=>Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,6);
+    for(const row of candidates){if(examined++>=6)break;try{const full=await resolveFinancialOrder(row);await ensureProviderRuntime(row.providerId);const prov=getProviderById(row.providerId,{allowSingleFallback:false}).prov;if(!prov?.url||!prov?.key)continue;const d=await providerRequest(prov,{action:'status',order:String(row.providerOrderId)},6500);const normalized=normalizeProviderStatus(extractProviderStatus(d));if(normalized==='unknown')continue;await syncVerifiedOrderStatus(full,d,normalized);}catch(e){console.warn('refund/order status monitor:',String(e.message||e).slice(0,120));}}
   }catch(e){console.warn('refund reconciliation monitor:',String(e.message||e).slice(0,160));}finally{runRefundReconciliationMonitor.running=false;}
+}
+
+let PROVIDER_ORDER_STATUS_MONITOR_RUNNING=false;
+let PROVIDER_ORDER_STATUS_MONITOR_LAST_AT='';
+const PROVIDER_ORDER_STATUS_LOCKS=new Set();
+async function runProviderOrderStatusMonitor(){
+  if(PROVIDER_ORDER_STATUS_MONITOR_RUNNING)return;
+  PROVIDER_ORDER_STATUS_MONITOR_RUNNING=true;
+  try{
+    const snapshot=await loadOrderMonitorSnapshot();
+    if(!snapshot?.firebaseAvailable||!Array.isArray(snapshot.rows)||!snapshot.rows.length)return;
+    const now=Date.now();
+    const candidates=snapshot.rows.filter(row=>!row.legacyHistory&&shouldAutoRefreshProviderOrderStatus(row,now))
+      .sort((a,b)=>(Date.parse(a.statusSyncLastAttemptAt||a.lastCheckedAt||0)||0)-(Date.parse(b.statusSyncLastAttemptAt||b.lastCheckedAt||0)||0)||(Number(a.createdMs||0)-Number(b.createdMs||0)));
+    const candidate=candidates.find(row=>{
+      const lock=String(row.providerId||'')+'|'+String(row.providerOrderId||row.smmpartyOrderId||'');
+      return lock!=='|'&&!PROVIDER_ORDER_STATUS_LOCKS.has(lock);
+    });
+    if(!candidate)return;
+    const lockKey=String(candidate.providerId||'')+'|'+String(candidate.providerOrderId||candidate.smmpartyOrderId||'');
+    PROVIDER_ORDER_STATUS_LOCKS.add(lockKey);
+    try{
+      await ensureProviderRuntime(String(candidate.providerId||''));
+      const {prov}=getProviderById(String(candidate.providerId||''),{allowSingleFallback:false});
+      const row={...candidate,_firebaseKey:String(candidate._firebaseKey||candidate.firebaseKey||'')};
+      const checked=await checkAndSyncProviderOrderStatus(row,prov,{attempts:1,timeoutMs:4500});
+      const updated={...row,...(checked.order||{}),statusSyncLastAttemptAt:(checked.order?.statusSyncLastAttemptAt||nowISO())};
+      const identity=auditIdentity(candidate);
+      for(const item of snapshot.rows)if(auditIdentity(item)===identity)Object.assign(item,updated);
+      if(ORDER_MONITOR_SNAPSHOT_VALUE&&Array.isArray(ORDER_MONITOR_SNAPSHOT_VALUE.rows)){
+        for(const item of ORDER_MONITOR_SNAPSHOT_VALUE.rows)if(auditIdentity(item)===identity)Object.assign(item,updated);
+      }
+      PROVIDER_ORDER_STATUS_MONITOR_LAST_AT=String(updated.statusSyncLastAttemptAt||updated.lastCheckedAt||nowISO());
+      if(!checked.ok&&checked.error!=='provider-link-or-credentials-missing')console.warn('provider status monitor:',String(checked.error||'status-check-failed').slice(0,120));
+    }finally{PROVIDER_ORDER_STATUS_LOCKS.delete(lockKey);}
+  }catch(e){console.warn('provider status monitor cycle:',String(e.message||e).slice(0,140));}
+  finally{PROVIDER_ORDER_STATUS_MONITOR_RUNNING=false;}
 }
 
 const DEFAULT_GLOBAL_PRICING={markupPct:100,autoSync:true,intervalHours:1,intervalMinutes:5,lastAttemptAt:null,lastSuccessAt:null,lastUpdatedAt:null,lastResult:null,lastError:''};
@@ -4528,10 +4571,10 @@ function upsertLocalApiOrder(order){
 }
 async function loadApiOwnedOrders(username){
   let remote;
-  try{remote=await firebaseGetJson('orders',12000);}catch(e){throw Object.assign(new Error('تعذر قراءة الطلبات من Firebase؛ لم نعرض بيانات محلية على أنها كاملة.'),{code:'orders_database_unavailable'});}
+  try{remote=await firebaseGetUserOrders(username,12000);}catch(e){throw Object.assign(new Error('تعذر قراءة طلبات المستخدم من استعلام Firebase المحدود: '+String(e.message||e).slice(0,140)),{code:'orders_database_unavailable'});}
   const map=new Map();
-  const entries=Array.isArray(remote)?remote.map((v,i)=>[String(i),v]):(remote&&typeof remote==='object'?Object.entries(remote):[]);
-  for(const [key,o] of entries){if(!o||typeof o!=='object'||o.event||String(o.user||o.username||'')!==String(username))continue;const id=String(o.id||o.siteOrderId||o.orderId||'');if(!id)continue;map.set(id,{...o,id,_firebaseKey:String(o._firebaseKey||key)});}
+  const entries=collectionEntries(remote.data);
+  for(const [key,o] of entries){if(!o||typeof o!=='object'||o.event||String(o.user||o.username||o.userName||'')!==String(username))continue;const id=String(o.id||o.siteOrderId||o.orderId||'');if(!id)continue;map.set(id,{...o,id,_firebaseKey:String(o._firebaseKey||key)});}
   for(const o of (Array.isArray(readJSON('orders.json',[]))?readJSON('orders.json',[]):[])){if(!o||o.event||String(o.user||o.username||'')!==String(username))continue;const id=String(o.id||o.siteOrderId||'');if(!id)continue;const prior=map.get(id);map.set(id,prior?{...o,...prior,id,_firebaseKey:prior._firebaseKey||firebaseSafeKey(id)}:{...o,id,_firebaseKey:firebaseSafeKey(id)});}
   return [...map.values()].sort((a,b)=>(Date.parse(b.createdAt||0)||0)-(Date.parse(a.createdAt||0)||0));
 }
@@ -4916,6 +4959,65 @@ function uniqueActualOrders(remoteOrders,localOrders=[]){
   return [...map.values()];
 }
 
+// Paginated order scan for aggregate screens. It never materializes the complete Firebase
+// orders root in one response; each network page is at most 600 records and pages are sequential.
+let FIREBASE_ORDER_AGGREGATES_CACHE={at:0,value:null,promise:null};
+const FIREBASE_ORDER_AGGREGATES_TTL_MS=120000;
+async function getFirebaseOrderAggregates(force=false){
+  const now=Date.now();
+  if(!force&&FIREBASE_ORDER_AGGREGATES_CACHE.value&&now-FIREBASE_ORDER_AGGREGATES_CACHE.at<FIREBASE_ORDER_AGGREGATES_TTL_MS)return {...FIREBASE_ORDER_AGGREGATES_CACHE.value,cached:true};
+  if(FIREBASE_ORDER_AGGREGATES_CACHE.promise)return FIREBASE_ORDER_AGGREGATES_CACHE.promise;
+  FIREBASE_ORDER_AGGREGATES_CACHE.promise=(async()=>{
+    const pageSize=600,maxRows=12000,maxPages=Math.ceil(maxRows/pageSize);let lastKey='',pages=0,scanned=0,complete=false,latestPublicOrderNo=0;
+    const identities=new Set(),countsByUser=new Map(),countsByLegacyId=new Map();
+    while(pages<maxPages&&scanned<maxRows){
+      const query={orderBy:'"$key"',limitToFirst:lastKey?pageSize+1:pageSize};
+      if(lastKey)query.startAt=JSON.stringify(lastKey);
+      const page=await firebaseGetQueryJson('orders',query,12000);const entries=collectionEntries(page);
+      const fresh=lastKey?entries.filter(([key])=>String(key)!==lastKey):entries;
+      if(!fresh.length){complete=true;break;}
+      pages++;
+      for(const [key,order] of fresh){
+        if(scanned>=maxRows){complete=false;break;}
+        if(!order||typeof order!=='object'||Array.isArray(order)||order.event)continue;
+        scanned++;
+        const identity=stableOrderCountIdentity(order,key);if(!identity||identities.has(identity))continue;identities.add(identity);
+        const username=String(order.user||order.username||order.userName||'').trim();if(username)countsByUser.set(username,(countsByUser.get(username)||0)+1);
+        const legacyId=String(order.legacyUserId||'').trim();if(legacyId)countsByLegacyId.set(legacyId,(countsByLegacyId.get(legacyId)||0)+1);
+        const pub=Number(order.publicOrderNo||order.publicOrderNumber||order.id||order.siteOrderId||0);if(Number.isSafeInteger(pub)&&pub>=3000)latestPublicOrderNo=Math.max(latestPublicOrderNo,pub);
+      }
+      lastKey=String(fresh[fresh.length-1][0]||'');
+      if(fresh.length<pageSize){complete=true;break;}
+    }
+    if(scanned>=maxRows){
+      // Distinguish exactly 12,000 records from a larger database without reading another full page.
+      const probe=await firebaseGetQueryJson('orders',{orderBy:'"$key"',startAt:JSON.stringify(lastKey),limitToFirst:2},8000);
+      const extra=collectionEntries(probe).some(([key])=>String(key)!==lastKey);complete=!extra;
+    }
+    const result={ok:true,totalOrders:identities.size,scanned,latestPublicOrderNo,countsByUser:Object.fromEntries(countsByUser),countsByLegacyId:Object.fromEntries(countsByLegacyId),complete,pages,source:'firebase-paginated-key-scan',warning:complete?'':'تم فحص أول '+scanned.toLocaleString('en-US')+' سجل فقط حفاظاً على ذاكرة الخادم؛ العدد حد أدنى وليس إجمالي قاعدة البيانات.'};
+    FIREBASE_ORDER_AGGREGATES_CACHE={at:Date.now(),value:result,promise:null};return {...result,cached:false};
+  })().catch(error=>{FIREBASE_ORDER_AGGREGATES_CACHE={at:0,value:null,promise:null};throw error;});
+  return FIREBASE_ORDER_AGGREGATES_CACHE.promise;
+}
+
+// Explicit migration-only snapshot: bounded to 12,000 records in sequential pages.
+// If the live tree is larger, stop before mutation instead of reading the whole node.
+async function getFirebaseOrderRowsForMigration(maxRows=12000){
+  const cap=Math.max(500,Math.min(12000,Number(maxRows)||12000)),pageSize=300,rows=[];let lastKey='';
+  while(rows.length<cap){
+    const query={orderBy:'"$key"',limitToFirst:lastKey?pageSize+1:pageSize};if(lastKey)query.startAt=JSON.stringify(lastKey);
+    const page=await firebaseGetQueryJson('orders',query,12000),entries=collectionEntries(page),fresh=lastKey?entries.filter(([key])=>String(key)!==lastKey):entries;
+    if(!fresh.length)return Object.fromEntries(rows);
+    for(const [key,value] of fresh){if(rows.length>=cap)break;if(value&&typeof value==='object'&&!Array.isArray(value)&&!value.event)rows.push([String(key),value]);}
+    lastKey=String(fresh[fresh.length-1]?.[0]||'');
+    if(fresh.length<pageSize)return Object.fromEntries(rows);
+  }
+  const probe=await firebaseGetQueryJson('orders',{orderBy:'"$key"',startAt:JSON.stringify(lastKey),limitToFirst:2},8000);
+  const extra=collectionEntries(probe).filter(([key])=>String(key)!==lastKey);
+  if(extra.length)throw new Error('تجاوز عدد الطلبات '+cap+' سجلاً؛ أوقفنا معاينة/ترحيل القاعدة دون تحميلها كاملة. قسّم عملية الترحيل إلى دفعات.');
+  return Object.fromEntries(rows);
+}
+
 // Public dashboard metric: count unique order records, never confuse the latest public order number with total orders.
 let PUBLIC_SITE_ORDER_STATS_CACHE={at:0,value:null};
 let PUBLIC_SITE_ORDER_STATS_PROMISE=null;
@@ -4925,25 +5027,10 @@ async function getPublicSiteOrderStats(){
   if(PUBLIC_SITE_ORDER_STATS_CACHE.value&&now-PUBLIC_SITE_ORDER_STATS_CACHE.at<PUBLIC_SITE_ORDER_STATS_CACHE_MS)return {...PUBLIC_SITE_ORDER_STATS_CACHE.value,cached:true};
   if(PUBLIC_SITE_ORDER_STATS_PROMISE)return PUBLIC_SITE_ORDER_STATS_PROMISE;
   PUBLIC_SITE_ORDER_STATS_PROMISE=(async()=>{
-    const localOrders=readJSON('orders.json',[]);
-    let remoteOrders=null,firebaseOk=false,firebaseError='';
-    try{remoteOrders=await firebaseGetJson('orders',10000);firebaseOk=true;}
-    catch(e){firebaseError=String(e?.message||e).slice(0,140);}
-    const rows=uniqueActualOrders(firebaseOk?remoteOrders:null,localOrders);
-    if(!firebaseOk&&rows.length===0)throw new Error('تعذر قراءة الطلبات من Firebase ولا توجد سجلات محلية موثوقة؛ لم نعرض رقماً تخمينياً. '+firebaseError);
-    const latest=Math.max(maxPublicOrderNumberFromRows(firebaseOk?remoteOrders:null),maxPublicOrderNumberFromRows(localOrders));
-    const result={
-      ok:true,
-      count:rows.length,
-      totalOrders:rows.length,
-      latestPublicOrderNo:latest>=3000?latest:null,
-      source:firebaseOk?'firebase+local':'local-partial',
-      complete:firebaseOk,
-      warning:firebaseOk?'':'تم عرض السجلات المحلية فقط لأن الاتصال بقاعدة Firebase تعذر؛ قد لا يشمل العدد كل الطلبات. '+firebaseError,
-      updatedAt:nowISO()
-    };
-    PUBLIC_SITE_ORDER_STATS_CACHE={at:Date.now(),value:result};
-    return {...result,cached:false};
+    const aggregate=await getFirebaseOrderAggregates();
+    if(!aggregate||!Number.isFinite(Number(aggregate.totalOrders)))throw new Error('تعذر التحقق من إجمالي سجلات Firebase.');
+    const result={ok:true,count:aggregate.totalOrders,totalOrders:aggregate.totalOrders,latestPublicOrderNo:aggregate.latestPublicOrderNo>=3000?aggregate.latestPublicOrderNo:null,source:aggregate.source,complete:aggregate.complete,countIsLowerBound:!aggregate.complete,scanned:aggregate.scanned,pages:aggregate.pages,warning:aggregate.warning||'',updatedAt:nowISO()};
+    PUBLIC_SITE_ORDER_STATS_CACHE={at:Date.now(),value:result};return {...result,cached:false};
   })();
   try{return await PUBLIC_SITE_ORDER_STATS_PROMISE;}finally{PUBLIC_SITE_ORDER_STATS_PROMISE=null;}
 }
@@ -5099,7 +5186,7 @@ async function persistLegacyTransactionsRemote(rows,sourceId=LEGACY_SEED_ID){
   return {count,updatedAt:record.updatedAt};
 }
 async function readLegacyStage(){const stage=readJSON(LEGACY_STAGE_FILE,null);if(!stage||stage.version!==1||!Array.isArray(stage.users)||!Array.isArray(stage.orders))return null;return stage;}
-async function getLegacyRemoteSnapshot(){let remoteUsers,remoteOrders;try{[remoteUsers,remoteOrders]=await Promise.all([firebaseGetJson('users',12000),firebaseGetJson('orders',15000)]);}catch(e){throw Object.assign(new Error('تعذر الوصول إلى قاعدة Firebase الحية؛ لم يتم تغيير أي بيانات. '+String(e.message||e).slice(0,140)),{statusCode:503});}return {remoteUsers:remoteUsers||{},remoteOrders:remoteOrders||{}};}
+async function getLegacyRemoteSnapshot(){let remoteUsers,remoteOrders;try{[remoteUsers,remoteOrders]=await Promise.all([firebaseGetJson('users',12000),getFirebaseOrderRowsForMigration(12000)]);}catch(e){throw Object.assign(new Error('تعذر الوصول إلى قاعدة Firebase الحية ضمن الحدود الآمنة؛ لم يتم تغيير أي بيانات. '+String(e.message||e).slice(0,180)),{statusCode:503});}return {remoteUsers:remoteUsers||{},remoteOrders:remoteOrders||{}};}
 function createLegacyPlan(stage,remoteUsers,remoteOrders){
   const directory=normalizeCurrentUsers(remoteUsers),mapped=mapLegacyUsersToCurrent(stage.users,directory),remoteOrderRows=collectionEntries(remoteOrders).filter(([,o])=>o&&typeof o==='object'&&!o.event),legacyById=new Map();
   for(const [k,o] of remoteOrderRows)if(o.legacyHistory&&o.legacyImportKey)legacyById.set(String(o.legacyImportKey),{key:k,order:o});
@@ -6530,16 +6617,11 @@ async function routeAPI(req,res,urlObj){
 
   if(p==='/api/admin/users-directory'&&req.method==='GET'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
-    let remoteUsers={},remoteOrders={},ordersAvailable=true,warning='';
+    let remoteUsers={},ordersAvailable=true,warning='',orderAggregate=null;
     try{remoteUsers=await firebaseGetJson('users',12000);remoteUsers=remoteUsers||{};}catch(e){return json(res,503,{ok:false,error:'تعذر قراءة حسابات Firebase: '+String(e.message||e).slice(0,160)});}
-    try{remoteOrders=await firebaseGetJson('orders',15000);remoteOrders=remoteOrders||{};}catch(e){ordersAvailable=false;warning='تم تحميل المستخدمين، لكن تعذرت قراءة الطلبات الحقيقية: '+String(e.message||e).slice(0,120);}
+    try{orderAggregate=await getFirebaseOrderAggregates();}catch(e){ordersAvailable=false;warning='تم تحميل المستخدمين، لكن تعذر فحص الطلبات عبر الصفحات المحدودة: '+String(e.message||e).slice(0,120);}
     const directory=normalizeCurrentUsers(remoteUsers);
-    const orders=ordersAvailable?uniqueActualOrders(remoteOrders,readJSON('orders.json',[])):[];
-    const countsByUser=new Map(),countsByLegacyId=new Map();
-    for(const o of orders){
-      const username=String(o.user||o.username||o.userName||'').trim();if(username)countsByUser.set(username,(countsByUser.get(username)||0)+1);
-      const legacyId=String(o.legacyUserId||'').trim();if(legacyId)countsByLegacyId.set(legacyId,(countsByLegacyId.get(legacyId)||0)+1);
-    }
+    const countsByUser=new Map(Object.entries(orderAggregate?.countsByUser||{})),countsByLegacyId=new Map(Object.entries(orderAggregate?.countsByLegacyId||{}));
     const storedOld=readJSON(LEGACY_USERS_PRIVATE_FILE,[]);
     const stage=await readLegacyStage();
     let remoteLegacyUsers=[];let remoteLegacyError='';
@@ -6567,7 +6649,7 @@ async function routeAPI(req,res,urlObj){
     const q=String(urlObj.searchParams.get('q')||'').trim().toLowerCase();
     const filtered=result.filter(u=>!q||[u.username,u.name,u.email,u.legacyUserId].some(v=>String(v||'').toLowerCase().includes(q)));
     filtered.sort((a,b)=>Number(b.totalOrders||0)-Number(a.totalOrders||0)||String(b.joined||'').localeCompare(String(a.joined||''))||String(a.name||'').localeCompare(String(b.name||''),'ar'));
-    return json(res,200,{ok:true,users:filtered,total:result.length,currentUsers:directory.users.length,legacyUsers:legacyUsers.length,matchedLegacyUsers,legacyOnlyUsers,ordersAvailable,storageDurable:DATA_IS_EXTERNAL||remoteLegacyUsers.length>0,legacyUsersSavedRemotely:remoteLegacyUsers.length>0,source:ordersAvailable?'firebase+server-ledger':'firebase-users-only',warning:warning||(remoteLegacyError?'تعذر قراءة النسخة الدائمة لمستخدمي Base44: '+remoteLegacyError:(!DATA_IS_EXTERNAL&&!remoteLegacyUsers.length?'قائمة المستخدمين القديمة غير محفوظة سحابياً بعد. ارفع ملف التصدير وادمجه مرة أخيرة لحفظها بشكل دائم.':''))});
+    return json(res,200,{ok:true,users:filtered,total:result.length,currentUsers:directory.users.length,legacyUsers:legacyUsers.length,matchedLegacyUsers,legacyOnlyUsers,ordersAvailable,storageDurable:DATA_IS_EXTERNAL||remoteLegacyUsers.length>0,legacyUsersSavedRemotely:remoteLegacyUsers.length>0,source:ordersAvailable?'firebase-paginated+server-ledger':'firebase-users-only',ordersComplete:orderAggregate?.complete===true,warning:warning||(orderAggregate?.warning||'')||(remoteLegacyError?'تعذر قراءة النسخة الدائمة لمستخدمي Base44: '+remoteLegacyError:(!DATA_IS_EXTERNAL&&!remoteLegacyUsers.length?'قائمة المستخدمين القديمة غير محفوظة سحابياً بعد. ارفع ملف التصدير وادمجه مرة أخيرة لحفظها بشكل دائم.':''))});
   }
 
   if(p==='/api/admin/recharge-stats'&&req.method==='GET'){
@@ -6974,23 +7056,31 @@ async function routeAPI(req,res,urlObj){
     return json(res,200,{ok:true,uploaded:!!stage,stagedCounts:stage?.counts||null,lastImport:report||null,seedBootstrap:readJSON(LEGACY_SEED_STATUS_FILE,{}),importedSnapshotAvailable:remoteUsersCount>0,importedUsersCount:remoteUsersCount,storageDurable:DATA_IS_EXTERNAL||remoteUsersCount>0,remoteReadError,storageWarning:remoteUsersCount>0?'تم حفظ قائمة مستخدمي Base44 في قاعدة الموقع الدائمة؛ لا تحتاج إعادة رفع ملف ZIP بعد كل تحديث.':(remoteReadError?'تعذر فحص نسخة مستخدمي Base44 السحابية: '+remoteReadError:'لم يتأكد حفظ فهرس المستخدمين في Firebase بعد. لا توجد قاعدة تاريخية مضمّنة؛ ارفع نسخة تملكها واستخدم الاستيراد اليدوي فقط إذا أردت نقل سجل تاريخي.')});
   }
   if(p==='/api/admin/user-order-stats'&&req.method==='GET'){
-    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});let remoteUsers={},remoteOrders={};let firebaseAvailable=true;try{[remoteUsers,remoteOrders]=await Promise.all([firebaseGetJson('users',12000),firebaseGetJson('orders',15000)]);remoteUsers=remoteUsers||{};remoteOrders=remoteOrders||{};}catch(e){firebaseAvailable=false;return json(res,503,{ok:false,error:'تعذر قراءة المستخدمين والطلبات من Firebase: '+String(e.message||e).slice(0,140)});}
-    const directory=normalizeCurrentUsers(remoteUsers),currentByUsername=new Map(directory.users.map(u=>[u.username,u]));let oldUsers=readJSON(LEGACY_USERS_PRIVATE_FILE,[]);if(!Array.isArray(oldUsers)||!oldUsers.length){try{oldUsers=await loadLegacyUsersRemote();}catch(_){oldUsers=[];}}
-    const oldById=new Map((Array.isArray(oldUsers)?oldUsers:[]).map(u=>[String(u.id),u]));const legacyMatches=mapLegacyUsersToCurrent(oldUsers,directory);const localOrders=readJSON('orders.json',[]);const dedup=new Map();
-    const addOrder=(o,source,key='')=>{if(!o||typeof o!=='object'||Array.isArray(o)||o.event)return;const user=String(o.user||o.username||o.userName||'').trim();if(!user)return;const identity=String(o.legacyHistory?'legacy:'+o.legacyImportKey:(o.id||o.siteOrderId||o.orderId||o.order_id||o.providerOrderId||o.smmpartyOrderId||key||o.createdAt||''));if(!identity)return;dedup.set(user+'|'+identity,{o,user,source});};
-    for(const [i,o] of (Array.isArray(localOrders)?localOrders:[]).entries())addOrder(o,'local',String(i));for(const [k,o] of collectionEntries(remoteOrders))addOrder(o,o.legacyHistory?'legacy':'firebase',k);
-    const groups=new Map();
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    let remoteUsers={},aggregate;
+    try{[remoteUsers,aggregate]=await Promise.all([firebaseGetJson('users',12000),getFirebaseOrderAggregates()]);remoteUsers=remoteUsers||{};}
+    catch(e){return json(res,503,{ok:false,error:'تعذر قراءة المستخدمين أو ملخص الطلبات من Firebase: '+String(e.message||e).slice(0,140)});}
+    const directory=normalizeCurrentUsers(remoteUsers),currentByUsername=new Map(directory.users.map(u=>[u.username,u]));
+    let oldUsers=readJSON(LEGACY_USERS_PRIVATE_FILE,[]);if(!Array.isArray(oldUsers)||!oldUsers.length){try{oldUsers=await loadLegacyUsersRemote();}catch(_){oldUsers=[];}}
+    const legacyMatches=mapLegacyUsersToCurrent(oldUsers,directory),groups=new Map(),legacyCountByUsername=new Map();
     const ensureGroup=(groupKey,base={})=>{let g=groups.get(groupKey);if(!g){g={username:String(base.username||''),name:String(base.name||base.username||'مستخدم'),orderCount:0,legacyOrderCount:0,newOrderCount:0,balanceUsd:base.balanceUsd==null?null:Number(base.balanceUsd),balanceSource:base.balanceSource||'current-account',legacyUserId:base.legacyUserId||null,hasCurrentAccount:!!base.hasCurrentAccount,email:String(base.email||''),joined:String(base.joined||'')};groups.set(groupKey,g);}return g;};
-    // Include accounts even when they have zero orders, then enrich them from actual order rows.
     for(const curr of directory.users){ensureGroup('current:'+curr.username,{username:curr.username,name:String(curr.user.name||curr.user.fullName||curr.username),balanceUsd:Number(curr.user.balance||0)/FIXED_RATE,balanceSource:'current-account',hasCurrentAccount:true,email:curr.email,joined:curr.user.joined||curr.user.createdAt||curr.user.created_date||''});}
-    for(const old of (Array.isArray(oldUsers)?oldUsers:[])){const oldId=String(old.id||'');if(!oldId)continue;const matched=legacyMatches.byLegacyId.get(oldId);const groupKey=matched?'current:'+matched.username:'legacy:'+oldId;const g=ensureGroup(groupKey,matched?{username:matched.username,name:String(matched.user.name||matched.user.fullName||old.arabic_name||old.full_name||matched.username),balanceUsd:Number(matched.user.balance||0)/FIXED_RATE,balanceSource:'current-account',hasCurrentAccount:true,email:matched.email,joined:matched.user.joined||matched.user.createdAt||''}:{username:legacyAliasUser(oldId),name:String(old.arabic_name||old.full_name||('مستخدم قديم '+oldId.slice(0,8))),balanceUsd:Number(old.balance||0),balanceSource:'legacy-snapshot',legacyUserId:oldId,hasCurrentAccount:false,email:old.email,joined:old.created_date});if(!matched)g.legacyUserId=oldId;}
-    for(const {o,user} of dedup.values()){
-      const legacyId=String(o.legacyUserId||'');const old=oldById.get(legacyId);const matched=legacyId?legacyMatches.byLegacyId.get(legacyId):null;const curr=currentByUsername.get(user);const groupKey=matched?'current:'+matched.username:(curr?'current:'+user:(legacyId?'legacy:'+legacyId:'current:'+user));
-      const g=ensureGroup(groupKey,{username:matched?matched.username:(curr?user:(legacyId?legacyAliasUser(legacyId):user)),name:String(matched?.user.name||curr?.user.name||curr?.user.fullName||old?.arabic_name||old?.full_name||o.userName||o.name||user),balanceUsd:matched?Number(matched.user.balance||0)/FIXED_RATE:(curr?Number(curr.user.balance||0)/FIXED_RATE:Number(old?.balance||0)),balanceSource:(matched||curr)?'current-account':'legacy-snapshot',legacyUserId:legacyId||null,hasCurrentAccount:!!(matched||curr),email:matched?.email||curr?.email||old?.email||''});
-      g.orderCount++;if(o.legacyHistory)g.legacyOrderCount++;else g.newOrderCount++;if(curr||matched){const account=matched||curr;g.name=String(account.user.name||account.user.fullName||g.name);g.balanceUsd=Number(account.user.balance||0)/FIXED_RATE;g.balanceSource='current-account';g.hasCurrentAccount=true;}
+    for(const old of (Array.isArray(oldUsers)?oldUsers:[])){
+      const oldId=String(old.id||'');if(!oldId)continue;const matched=legacyMatches.byLegacyId.get(oldId),groupKey=matched?'current:'+matched.username:'legacy:'+oldId;
+      const g=ensureGroup(groupKey,matched?{username:matched.username,name:String(matched.user.name||matched.user.fullName||old.arabic_name||old.full_name||matched.username),balanceUsd:Number(matched.user.balance||0)/FIXED_RATE,balanceSource:'current-account',hasCurrentAccount:true,email:matched.email,joined:matched.user.joined||matched.user.createdAt||''}:{username:legacyAliasUser(oldId),name:String(old.arabic_name||old.full_name||('مستخدم قديم '+oldId.slice(0,8))),balanceUsd:Number(old.balance||0),balanceSource:'legacy-snapshot',legacyUserId:oldId,hasCurrentAccount:false,email:old.email,joined:old.created_date});
+      const legacyN=Number(aggregate.countsByLegacyId?.[oldId]||0);g.legacyOrderCount+=legacyN;g.orderCount+=legacyN;if(!matched)g.legacyUserId=oldId;else legacyCountByUsername.set(matched.username,(legacyCountByUsername.get(matched.username)||0)+legacyN);
     }
-    const q=String(urlObj.searchParams.get('q')||'').trim().toLowerCase();const limit=Math.min(1000,Math.max(5,Number(urlObj.searchParams.get('limit')||100)));const rows=[...groups.values()].filter(x=>!q||[x.name,x.username,x.email,x.legacyUserId].some(v=>String(v||'').toLowerCase().includes(q))).sort((a,b)=>b.orderCount-a.orderCount||a.name.localeCompare(b.name,'ar')).slice(0,limit);return json(res,200,{ok:true,users:rows,total:groups.size,orders:dedup.size,currentUsers:directory.users.length,legacyUsers:(Array.isArray(oldUsers)?oldUsers.length:0),firebaseAvailable,source:oldUsers.length?'firebase-users+legacy-snapshot':'firebase-users-only'});
+    for(const [username,totalRaw] of Object.entries(aggregate.countsByUser||{})){
+      const total=Math.max(0,Number(totalRaw)||0);if(!total)continue;const curr=currentByUsername.get(username),groupKey=curr?'current:'+username:'current:'+username;
+      const g=ensureGroup(groupKey,{username,name:username,hasCurrentAccount:!!curr,balanceUsd:curr?Number(curr.user.balance||0)/FIXED_RATE:null,balanceSource:curr?'current-account':'firebase-orders-only',email:curr?.email||''});
+      const legacy=Number(legacyCountByUsername.get(username)||0),newCount=Math.max(0,total-legacy);g.newOrderCount=Math.max(g.newOrderCount,newCount);g.orderCount=Math.max(g.orderCount,g.newOrderCount+g.legacyOrderCount);
+      if(curr){g.name=String(curr.user.name||curr.user.fullName||g.name);g.balanceUsd=Number(curr.user.balance||0)/FIXED_RATE;g.balanceSource='current-account';g.hasCurrentAccount=true;g.email=curr.email||g.email;}
+    }
+    const q=String(urlObj.searchParams.get('q')||'').trim().toLowerCase(),limit=Math.min(1000,Math.max(5,Number(urlObj.searchParams.get('limit')||100)));
+    const rows=[...groups.values()].filter(x=>!q||[x.name,x.username,x.email,x.legacyUserId].some(v=>String(v||'').toLowerCase().includes(q))).sort((a,b)=>b.orderCount-a.orderCount||a.name.localeCompare(b.name,'ar')).slice(0,limit);
+    return json(res,200,{ok:true,users:rows,total:groups.size,orders:aggregate.totalOrders,currentUsers:directory.users.length,legacyUsers:(Array.isArray(oldUsers)?oldUsers.length:0),firebaseAvailable:true,complete:aggregate.complete,countIsLowerBound:!aggregate.complete,scanned:aggregate.scanned,warning:aggregate.warning||'',source:oldUsers.length?'firebase-users+firebase-paginated-order-aggregates':'firebase-users+firebase-paginated-order-aggregates'});
   }
+
 
   // -------------------- Admin-only API key / database alignment diagnostics --------------------
   if(p==='/api/admin/api-key-diagnostics' && req.method==='GET'){
@@ -7072,19 +7162,12 @@ async function routeAPI(req,res,urlObj){
   if(p==='/api/admin/api-users' && req.method==='GET'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
     try{
-      const [remoteKeys,remoteUsers,remoteOrders,remoteBlocks]=await Promise.all([
-        firebaseGetJson('apiKeys',10000),firebaseGetJson('users',10000),firebaseGetJson('orders',12000),firebaseGetJson('apiKeyBlocks',9000)
+      const [remoteKeys,remoteUsers,orderAggregate,remoteBlocks]=await Promise.all([
+        firebaseGetJson('apiKeys',10000),firebaseGetJson('users',10000),getFirebaseOrderAggregates(),firebaseGetJson('apiKeyBlocks',9000)
       ]);
       if(!remoteKeys||typeof remoteKeys!=='object'||Array.isArray(remoteKeys))return json(res,503,{ok:false,error:'عقدة مفاتيح API غير متاحة أو ليست كائناً صالحاً في Firebase؛ لم نعرض قائمة فارغة مضللة.'});
       const users=normalizeCurrentUsers(remoteUsers||{});
-      const ownerOf=o=>String(o?.user||o?.username||o?.userName||o?.customerUsername||o?.customer_username||'').trim().toLowerCase();
-      const orderCount=new Map();
-      for(const [id,o] of collectionEntries(remoteOrders)){
-        if(!o||typeof o!=='object'||o.event)continue;
-        const u=ownerOf(o);if(!u)continue;
-        const identity=String(o.id||o.siteOrderId||o.orderId||o.order_id||o.providerOrderId||o.smmpartyOrderId||id);
-        const m=orderCount.get(u)||new Set();m.add(identity);orderCount.set(u,m);
-      }
+      const orderCount=new Map(Object.entries(orderAggregate.countsByUser||{}).map(([u,n])=>[String(u).trim().toLowerCase(),Number(n)||0]));
       const local=readJSON('api_keys.json',{});const merged=new Map();
       for(const [hash,rec] of Object.entries(local&&typeof local==='object'&&!Array.isArray(local)?local:{}))if(/^[a-f0-9]{64}$/i.test(hash)&&rec&&typeof rec==='object')merged.set(hash,{...rec});
       for(const [hash,rec] of Object.entries(remoteKeys))if(/^[a-f0-9]{64}$/i.test(hash)&&rec&&typeof rec==='object'&&!Array.isArray(rec))merged.set(hash,{...(merged.get(hash)||{}),...rec});
@@ -7094,10 +7177,10 @@ async function routeAPI(req,res,urlObj){
         const username=String(rec.username||'').trim();if(!username)continue;
         const user=users.nameMap.get(username.toLowerCase())?.[0]?.user||{};
         const status=String(rec.status||'active').trim().toLowerCase();const revoked=!!rec.revokedAt||['revoked','disabled','inactive'].includes(status);const pending=!revoked&&apiKeyIsPending(rec)&&!apiKeyUnusedExpired(rec);const apiBlocked=remoteBlocks?.[sha256(username.toLowerCase())]?.blocked===true;
-        rows.push({keyHash:hash,username,masked:String(rec.masked||'مفتاح مخفي'),createdAt:String(rec.createdAt||''),expiresAt:pending?new Date(apiKeyUnusedExpiresAt(rec)).toISOString():'',activatedAt:String(rec.activatedAt||''),lastUsedAt:String(rec.lastUsedAt||''),revokedAt:String(rec.revokedAt||''),apiBlocked,status:revoked?'revoked':apiBlocked?'blocked':pending?'pending':'active',scopes:Array.isArray(rec.scopes)?rec.scopes.map(x=>String(x)).slice(0,30):[],balanceIQD:Number(user.balance??0),orderCount:orderCount.get(username.toLowerCase())?.size||0});
+        rows.push({keyHash:hash,username,masked:String(rec.masked||'مفتاح مخفي'),createdAt:String(rec.createdAt||''),expiresAt:pending?new Date(apiKeyUnusedExpiresAt(rec)).toISOString():'',activatedAt:String(rec.activatedAt||''),lastUsedAt:String(rec.lastUsedAt||''),revokedAt:String(rec.revokedAt||''),apiBlocked,status:revoked?'revoked':apiBlocked?'blocked':pending?'pending':'active',scopes:Array.isArray(rec.scopes)?rec.scopes.map(x=>String(x)).slice(0,30):[],balanceIQD:Number(user.balance??0),orderCount:orderCount.get(username.toLowerCase())||0});
       }
       rows.sort((a,b)=>Number(a.status==='active')-Number(b.status==='active')||String(b.createdAt).localeCompare(String(a.createdAt))||a.username.localeCompare(b.username,'ar'));
-      return json(res,200,{ok:true,keys:rows,summary:{total:rows.length,active:rows.filter(x=>x.status==='active').length,pending:rows.filter(x=>x.status==='pending').length,blocked:rows.filter(x=>x.status==='blocked').length,revoked:rows.filter(x=>x.status==='revoked').length,users:[...new Set(rows.map(x=>x.username.toLowerCase()))].length},source:'firebase-apiKeys+firebase-users+firebase-orders',checkedAt:nowISO()});
+      return json(res,200,{ok:true,keys:rows,summary:{total:rows.length,active:rows.filter(x=>x.status==='active').length,pending:rows.filter(x=>x.status==='pending').length,blocked:rows.filter(x=>x.status==='blocked').length,revoked:rows.filter(x=>x.status==='revoked').length,users:[...new Set(rows.map(x=>x.username.toLowerCase()))].length},source:'firebase-apiKeys+firebase-users+firebase-paginated-order-aggregates',ordersComplete:orderAggregate.complete,ordersScanned:orderAggregate.scanned,warning:orderAggregate.warning||'',checkedAt:nowISO()});
     }catch(e){return json(res,503,{ok:false,error:'تعذر تحميل بيانات إدارة API من Firebase. لم نعرض أرقاماً افتراضية ولم نغيّر أي مفتاح.',details:String(e.message||e).slice(0,160)});}
   }
   if(p==='/api/admin/api-users/activity' && req.method==='GET'){
@@ -7105,28 +7188,22 @@ async function routeAPI(req,res,urlObj){
     const username=String(urlObj.searchParams.get('username')||'').trim();
     if(!username||username.length>120)return json(res,422,{ok:false,error:'اسم المستخدم غير صالح.'});
     try{
-      const [remoteUsers,remoteOrders,remoteKeys]=await Promise.all([firebaseGetJson('users',10000),firebaseGetJson('orders',12000),firebaseGetJson('apiKeys',10000)]);
-      const normalized=normalizeCurrentUsers(remoteUsers||{});const matched=normalized.nameMap.get(username.toLowerCase())||[];const userRow=matched[0]||null;const user=userRow?.user||{};
-      const ownerUsername=o=>String(o?.user||o?.username||o?.userName||o?.customerUsername||o?.customer_username||o?.user_name||'').trim().toLowerCase();
-      const idSet=new Set([user.id,user.uid,user.user_id,user.userId,userRow?.key].filter(Boolean).map(String));
-      const matches=[];const seenOrders=new Set();let totalSpent=0;let currency='USD';
-      for(const [key,o] of collectionEntries(remoteOrders)){
-        if(!o||typeof o!=='object'||o.event)continue;
-        const owner=ownerUsername(o),orderUid=String(o.user_id||o.userId||o.uid||'');
-        if(owner!==username.toLowerCase()&&(!orderUid||!idSet.has(orderUid)))continue;
-        const id=String(o.id||o.siteOrderId||o.orderId||o.order_id||key);if(seenOrders.has(id))continue;seenOrders.add(id);
-        const price=Number(o.total_price??o.totalPrice??o.charge??o.price??o.total??o.amount??0);if(Number.isFinite(price))totalSpent+=price;
-        const item={id,orderNumber:String(o.order_number||o.orderNumber||o.siteOrderId||o.id||key),service:String(o.service_name||o.serviceName||o.service||o.name||'خدمة'),platform:String(o.platform_name||o.platform||''),provider:String(o.provider_name||o.providerName||o.provider||''),providerOrderId:String(o.provider_order_id||o.providerOrderId||o.externalOrderId||''),quantity:Number(o.quantity||o.qty||0)||0,link:String(o.link||o.url||''),price:Number.isFinite(price)?price:0,status:String(o.status||o.order_status||'غير معروف'),createdAt:String(o.created_date||o.createdAt||o.created_at||o.timestamp||''),updatedAt:String(o.updated_date||o.updatedAt||o.updated_at||'')};
-        matches.push(item);
-      }
+      const [remoteUsers,remoteKeys]=await Promise.all([firebaseGetJson('users',10000),firebaseGetJson('apiKeys',10000)]);
+      const normalized=normalizeCurrentUsers(remoteUsers||{}),matched=normalized.nameMap.get(username.toLowerCase())||[],userRow=matched[0]||null,user=userRow?.user||{};
+      const ownerValues=[username,user.username,user.userName,user.id,user.uid,user.user_id,user.userId,userRow?.key].map(x=>String(x||'').trim()).filter(Boolean);
+      const uniqueValues=[...new Set(ownerValues)].slice(0,6),orderResults=await Promise.allSettled(uniqueValues.map(value=>firebaseGetQueryJson('orders',{orderBy:'"user"',equalTo:JSON.stringify(value),limitToLast:500},9000)));
+      const orderMap=new Map();let queriesOk=0,queryErrors=[];
+      orderResults.forEach(result=>{if(result.status!=='fulfilled'){queryErrors.push(String(result.reason?.message||'تعذر قراءة طلبات الحساب').slice(0,90));return;}queriesOk++;for(const [key,o] of collectionEntries(result.value)){if(!o||typeof o!=='object'||o.event)continue;const id=String(o.id||o.siteOrderId||o.orderId||o.order_id||key);const prior=orderMap.get(id)||{};orderMap.set(id,{...prior,...o});}});
+      const rows=[...orderMap.entries()],matches=[];let totalSpent=0,currency='USD';
+      for(const [id,o] of rows){const price=Number(o.total_price??o.totalPrice??o.charge??o.price??o.total??o.amount??0);if(Number.isFinite(price))totalSpent+=price;const item={id,orderNumber:String(o.order_number||o.orderNumber||o.siteOrderId||o.id||id),service:String(o.service_name||o.serviceName||o.service||o.name||'خدمة'),platform:String(o.platform_name||o.platform||''),provider:String(o.provider_name||o.providerName||o.provider||''),providerOrderId:String(o.provider_order_id||o.providerOrderId||o.externalOrderId||''),quantity:Number(o.quantity||o.qty||0)||0,link:String(o.link||o.url||''),price:Number.isFinite(price)?price:0,status:String(o.status||o.order_status||'غير معروف'),createdAt:String(o.created_date||o.createdAt||o.created_at||o.timestamp||''),updatedAt:String(o.updated_date||o.updatedAt||o.updated_at||'')};matches.push(item);}
       matches.sort((a,b)=>(Date.parse(b.createdAt)||0)-(Date.parse(a.createdAt)||0));
-      const balanceRaw=user.balance??user.balanceUSD??user.balance_usd??user.wallet??0;
-      const balanceCurrency=String(user.currency||user.balanceCurrency||user.balance_currency||(user.balanceUSD!==undefined||user.balance_usd!==undefined?'USD':'IQD'));
+      const balanceRaw=user.balance??user.balanceUSD??user.balance_usd??user.wallet??0,balanceCurrency=String(user.currency||user.balanceCurrency||user.balance_currency||(user.balanceUSD!==undefined||user.balance_usd!==undefined?'USD':'IQD'));
       const account={username:String(user.username||userRow?.username||username),arabicName:String(user.arabic_name||user.arabicName||''),fullName:String(user.full_name||user.fullName||''),name:String(user.name||user.displayName||''),email:firebaseRecordEmail(user)||String(user.email||''),phone:String(user.phone||user.phone_number||user.mobile||''),balance:Number(balanceRaw)||0,balanceDisplay:(Number(balanceRaw)||0).toLocaleString('en-US',{maximumFractionDigits:4})+(balanceCurrency.toUpperCase()==='IQD'?' د.ع':' '+balanceCurrency),balanceCurrency,role:String(user.role||'user'),status:String(user.status||user.accountStatus||'غير محدد'),createdAt:String(user.created_at||user.createdAt||user.created_date||user.registeredAt||''),lastLogin:String(user.lastLogin||user.last_login||user.lastSeen||''),userId:String(user.id||user.uid||user.user_id||user.userId||userRow?.key||''),freePoints:Number(user.free_points??user.freePoints??0)||0,userCode:String(user.user_code||user.userCode||''),referralCode:String(user.referral_code||user.referralCode||''),customDiscount:Number(user.custom_discount??user.customDiscount??0)||0};
       const keys=collectionEntries(remoteKeys).filter(([hash,k])=>k&&String(k.username||'').toLowerCase()===username.toLowerCase()&&/^[a-f0-9]{64}$/i.test(hash)).map(([hash,k])=>({keyHash:hash,masked:String(k.masked||'مفتاح مخفي'),status:k.revokedAt?'revoked':String(k.status||'active'),createdAt:String(k.createdAt||''),lastUsedAt:String(k.lastUsedAt||''),activatedAt:String(k.activatedAt||''),expiresAt:String(k.unusedExpiresAt||k.expiresAt||'')}));
-      return json(res,200,{ok:true,username,account,keys,orders:matches.slice(0,100),summary:{orderCount:matches.length,totalSpent:Number(totalSpent.toFixed(4)),currency},source:'firebase-users+firebase-orders+firebase-apiKeys',checkedAt:nowISO()});
+      return json(res,200,{ok:true,username,account,keys,orders:matches.slice(0,100),summary:{orderCount:matches.length,totalSpent:Number(totalSpent.toFixed(4)),currency},ordersComplete:queriesOk===uniqueValues.length,ordersSource:'firebase-indexed-user-queries',warning:queryErrors.join(' | ')||undefined,checkedAt:nowISO()});
     }catch(e){return json(res,503,{ok:false,error:'تعذر تحميل نشاط حساب API من Firebase؛ لم يتم عرض بيانات افتراضية.',details:String(e.message||e).slice(0,150)});}
   }
+
   if(p==='/api/admin/api-users/block' && req.method==='POST'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
     const b=await bodyJSON(req);const username=String(b.username||'').trim();const blocked=b.blocked===true;
@@ -7215,7 +7292,7 @@ async function routeAPI(req,res,urlObj){
     const settings=await getOrderAuditSettings();
     const result=auditPageFilter(snapshot.rows,{view:urlObj.searchParams.get('view'),q:urlObj.searchParams.get('q'),numberType:urlObj.searchParams.get('numberType'),provider:urlObj.searchParams.get('provider'),platform:urlObj.searchParams.get('platform'),service:urlObj.searchParams.get('service'),status:urlObj.searchParams.get('status'),delay:urlObj.searchParams.get('delay'),range:urlObj.searchParams.get('range'),sort:urlObj.searchParams.get('sort'),page:urlObj.searchParams.get('page'),limit:urlObj.searchParams.get('limit')},settings);
     result.items=await orderAuditEnrichUsers(result.items);
-    result.source={...result.source,orderCount:snapshot.rows.length,readAt:new Date(snapshot.at).toISOString(),warning:!snapshot.firebaseAvailable?'عرض جزئي من سجل الخادم؛ تعذر تأكيد بيانات Firebase.':''};
+    result.source={...result.source,orderCount:snapshot.rows.length,bounded:true,totalCountKnown:false,readAt:new Date(snapshot.at).toISOString(),warning:!snapshot.firebaseAvailable?'عرض جزئي من سجل الخادم؛ تعذر تأكيد بيانات Firebase.':'نافذة فحص محدودة من أحدث/الحالات النشطة؛ هذا الرقم ليس إجمالي كل طلبات قاعدة البيانات.'};
     return json(res,200,{ok:true,...result});
   }
   if(p==='/api/admin/order-audit/check' && req.method==='POST'){
@@ -7291,10 +7368,14 @@ async function routeAPI(req,res,urlObj){
   if(p==='/api/admin/stats' && req.method==='GET'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});const range=String(urlObj.searchParams.get('range')||'all');if(!['today','7d','month','all'].includes(range))return json(res,422,{ok:false,error:'نطاق غير صالح'});
     const local=readJSON('orders.json',[]),map=new Map();const keyOf=(o,k='')=>String(o?.id||o?.siteOrderId||o?.orderId||o?.order_id||o?.providerOrderId||(String(o?.user||o?.username||'')+'|'+String(o?.createdAt||'')+'|'+String(o?.serviceId||'')+'|'+String(o?.quantity||''))||k);
-    for(const o of Array.isArray(local)?local:[])if(o&&!o.event)map.set(keyOf(o),o);let firebaseAvailable=false,firebaseError='';
-    try{const remote=await firebaseGetJson('orders',6000);firebaseAvailable=true;if(remote&&typeof remote==='object'){const entries=Array.isArray(remote)?remote.map((o,i)=>[String(i),o]):Object.entries(remote);for(const [k,o] of entries){if(!o||typeof o!=='object'||o.event)continue;const key=keyOf(o,k);map.set(key,{...(map.get(key)||{}),...o,...(map.get(key)?.providerCostUsd!==undefined&&o.providerCostUsd===undefined?{providerCostUsd:map.get(key).providerCostUsd}:{})});}}}catch(e){firebaseError=String(e.message||e).slice(0,160);}
-    const stats=statsSnapshot(range,[...map.values()]);stats.source=firebaseAvailable?'firebase+local':'local-only';stats.firebaseAvailable=firebaseAvailable;return json(res,200,{ok:true,range,stats,warning:firebaseAvailable?'':('تعذر قراءة طلبات Firebase؛ الأرقام محسوبة من سجل الخادم المتاح فقط. '+firebaseError)});
+    for(const o of Array.isArray(local)?local:[])if(o&&!o.event)map.set(keyOf(o),o);
+    let firebaseAvailable=false,firebaseError='',sampled=false;
+    try{const snapshot=await loadOrderMonitorSnapshot();firebaseAvailable=!!snapshot.firebaseAvailable;sampled=true;for(const o of snapshot.rows||[]){if(!o||typeof o!=='object'||o.event)continue;const key=keyOf(o);map.set(key,{...(map.get(key)||{}),...o,...(map.get(key)?.providerCostUsd!==undefined&&o.providerCostUsd===undefined?{providerCostUsd:map.get(key).providerCostUsd}:{})});}firebaseError=String(snapshot.firebaseError||'');}catch(e){firebaseError=String(e.message||e).slice(0,160);}
+    const stats=statsSnapshot(range,[...map.values()]);stats.source=firebaseAvailable?'firebase-bounded-sample+local':'local-only';stats.firebaseAvailable=firebaseAvailable;stats.sampled=sampled;
+    const warning=firebaseAvailable?'تنبيه: هذه أرقام من عينة محدودة من أحدث الطلبات والحالات النشطة، وليست إجمالي كل سجل Firebase. '+firebaseError:('تعذر قراءة عينة طلبات Firebase؛ الأرقام محسوبة من سجل الخادم المتاح فقط. '+firebaseError);
+    return json(res,200,{ok:true,range,stats,sampled,sampleSize:map.size,warning});
   }
+
   if(p==='/api/admin/dashboard'&&req.method==='GET'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
     const nowMs=Date.now();
@@ -7331,7 +7412,8 @@ async function routeAPI(req,res,urlObj){
         usersCount=keys.filter(k=>!knownAdmin.has(String(k).toLowerCase())).length;usersApproximate=false;userCountSource='firebase-shallow-keys';
       }
       // Exact Firebase key count via a shallow/key-only response, cached separately for 10 minutes.
-      const payload={ok:true,source:'bounded-firebase-window+hosting-ledger',users:usersCount,usersApproximate,usersCountSource:userCountSource,orders:orders.length,revenueIQD,pendingOrders,pendingPayments,checkedAt:nowISO(),window:{orders:Math.min(1000,orders.length),payments:Math.min(300,payMap.size)},warning:[orderWarning,paymentWarning,userCountWarning].filter(Boolean).join(' | ')||undefined};
+      const dashboardWarnings=[orderWarning,paymentWarning,userCountWarning,'عدد الطلبات في هذه البطاقة يمثل سجل الاستضافة مع أحدث 1000 طلب من Firebase، وليس إجمالي الشجرة الكاملة.'].filter(Boolean);
+      const payload={ok:true,source:'bounded-firebase-window+hosting-ledger',users:usersCount,usersApproximate,usersCountSource:userCountSource,orders:orders.length,ordersIsBoundedSample:true,ordersAreLowerBound:true,revenueIQD,pendingOrders,pendingPayments,checkedAt:nowISO(),window:{orders:Math.min(1000,orders.length),payments:Math.min(300,payMap.size)},warning:dashboardWarnings.join(' | ')};
       ADMIN_DASHBOARD_CACHE={at:Date.now(),value:payload,promise:null};return payload;
     })();
     try{return json(res,200,await ADMIN_DASHBOARD_CACHE.promise);}catch(e){ADMIN_DASHBOARD_CACHE.promise=null;return json(res,503,{ok:false,error:'تعذر تحديث الإحصائيات: '+String(e.message||e).slice(0,180),source:'unavailable'});}
@@ -7357,7 +7439,7 @@ async function routeAPI(req,res,urlObj){
     // Only query this user's orders; never download the whole orders collection for one profile.
     let ordersAvailable=false;
     const canonicalNames=[...new Set([username,user.username,localKey].map(x=>String(x||'').trim()).filter(Boolean))];
-    const orderQueries=await Promise.allSettled(canonicalNames.map(name=>firebaseGetQueryJson('orders',{orderBy:'"user"',equalTo:JSON.stringify(name)},10000)));
+    const orderQueries=await Promise.allSettled(canonicalNames.map(name=>firebaseGetQueryJson('orders',{orderBy:'"user"',equalTo:JSON.stringify(name),limitToLast:500},10000)));
     for(const result of orderQueries){if(result.status==='fulfilled'){for(const [key,o] of collectionEntries(result.value))addOrder(o);ordersAvailable=true;}else remoteError=remoteError||String(result.reason?.message||result.reason||'orders unavailable').slice(0,140);}
     const ledgerMap=new Map();const addLedger=(ev,key='')=>{if(!ev||typeof ev!=='object'||Array.isArray(ev))return;const who=String(ev.username||ev.user||ev.account||'').trim().toLowerCase();if(who&&!aliases.has(who))return;const id=String(ev.id||key||'');if(id)ledgerMap.set(id,{...(ledgerMap.get(id)||{}),...ev});};
     for(const ev of readJSON('balance_ledger.json',[]))addLedger(ev);
@@ -7462,7 +7544,7 @@ async function routeAPI(req,res,urlObj){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
     const q=String(urlObj.searchParams.get('q')||'').trim().toLowerCase();let firebaseAvailable=true,warning='';let peopleRoot={},remoteOrderRoot={};
     try{peopleRoot=await firebaseGetJson('users',12000)||{};}catch(e){firebaseAvailable=false;warning='تعذر قراءة مستخدمي Firebase: '+String(e.message||e).slice(0,120)}
-    try{remoteOrderRoot=await firebaseGetJson('orders',12000)||{};}catch(e){firebaseAvailable=false;warning=(warning?warning+' · ':'')+'تعذر قراءة الطلبات من Firebase: '+String(e.message||e).slice(0,120)}
+    try{const snapshot=await loadOrderMonitorSnapshot();remoteOrderRoot=Object.fromEntries((snapshot.rows||[]).map((o,i)=>[String(o.firebaseKey||o.id||i),o]));if(!snapshot.firebaseAvailable)throw new Error(snapshot.firebaseError||'لا توجد عينة Firebase مؤكدة');warning+=(warning?' · ':'')+'ربط تفاصيل الاسترداد بالطلبات يعتمد على أحدث عينة محدودة؛ قد لا تظهر بيانات الطلبات القديمة هنا.';}catch(e){firebaseAvailable=false;warning+=(warning?' · ':'')+'تعذر قراءة عينة طلبات Firebase: '+String(e.message||e).slice(0,120)}
     const profileByUser=new Map(),profileByEmail=new Map();
     for(const [key,u] of collectionEntries(peopleRoot)){if(!u||typeof u!=='object'||Array.isArray(u))continue;const username=String(u.username||u.userName||u.user||u.handle||decodeFirebaseSafeKey(key)||key).trim(),email=String(firebaseRecordEmail(u)||'').trim().toLowerCase();if(username)profileByUser.set(username.toLowerCase(),{...u,username,email});if(email)profileByEmail.set(email,{...u,username,email});}
     for(const [key,u] of Object.entries(readJSON('users.json',{users:{}}).users||{})){if(!u||typeof u!=='object')continue;const username=String(u.username||u.userName||u.user||key).trim(),email=String(firebaseRecordEmail(u)||'').trim().toLowerCase();if(username&&!profileByUser.has(username.toLowerCase()))profileByUser.set(username.toLowerCase(),{...u,username,email});if(email&&!profileByEmail.has(email))profileByEmail.set(email,{...u,username,email});}
@@ -7484,7 +7566,7 @@ async function routeAPI(req,res,urlObj){
       const user=await firebaseUserByUsername(username);if(!user)return json(res,200,{ok:true,user:username,balanceIQD:0,balanceUSD:0,refunds:[],warning:'لم يتم العثور على سجل رصيد المستخدم في Firebase.'});
       const map=user.sadaRefunds&&typeof user.sadaRefunds==='object'?user.sadaRefunds:{};const rows=[];for(const [refundKey,entry] of Object.entries(map)){if(!entry||typeof entry!=='object')continue;const events=Array.isArray(entry.events)&&entry.events.length?entry.events:[{...entry,id:entry.id||refundKey,orderId:entry.orderId,amountIQD:entry.totalIQD||entry.amountIQD,amountUSD:entry.amountUSD,status:entry.status,createdAt:entry.updatedAt||entry.createdAt}];for(const ev of events)rows.push({...ev,user:username});}
       const global=readJSON('refunds.json',[]);for(const r of global.filter(x=>String(x.user||'').toLowerCase()===username.toLowerCase())){if(!rows.some(y=>y.id&&y.id===r.id))rows.push(r)}
-      let orderRows=readJSON('orders.json',[]).filter(o=>o&&typeof o==='object'&&!o.event);try{const remote=await firebaseGetJson('orders',8000);for(const [key,o] of collectionEntries(remote)){if(!o||typeof o!=='object'||o.event)continue;const idx=orderRows.findIndex(x=>String(x.user||x.username||'').toLowerCase()===String(o.user||o.username||'').toLowerCase()&&String(x.id||x.siteOrderId||'')===String(o.id||o.siteOrderId||''));if(idx>=0)orderRows[idx]={...orderRows[idx],...o};else orderRows.push({...o,_firebaseKey:key});}}catch(_){}
+      let orderRows=readJSON('orders.json',[]).filter(o=>o&&typeof o==='object'&&!o.event&&String(o.user||o.username||'').toLowerCase()===username.toLowerCase());try{const remote=await firebaseGetUserOrders(username,8000);for(const [key,o] of collectionEntries(remote.data)){if(!o||typeof o!=='object'||o.event)continue;const idx=orderRows.findIndex(x=>String(x.id||x.siteOrderId||'')===String(o.id||o.siteOrderId||''));if(idx>=0)orderRows[idx]={...orderRows[idx],...o,_firebaseKey:key};else orderRows.push({...o,_firebaseKey:key});}}catch(_){}
       const profileEmail=String(firebaseRecordEmail(user)||'');for(let i=0;i<rows.length;i++){const r=rows[i],o=orderRows.find(x=>String(x.user||x.username||'').toLowerCase()===username.toLowerCase()&&((r.orderId&&[x.id,x.siteOrderId,x.publicOrderNo,x.orderId].some(v=>String(v||'')===String(r.orderId)))||(r.providerOrderId&&String(x.providerOrderId||x.smmpartyOrderId||'')===String(r.providerOrderId))))||{};const rawCharged=o.totalIQD??o.total??(Number(o.chargeUsd||0)*FIXED_RATE);const charged=Number(rawCharged||0);rows[i]={...r,email:profileEmail,publicOrderNo:String(o.publicOrderNo||(/^[0-9]+$/.test(String(r.orderId||''))?r.orderId:'')||''),siteOrderId:String(o.id||o.siteOrderId||r.orderId||''),providerOrderId:String(r.providerOrderId||o.providerOrderId||o.smmpartyOrderId||''),serviceName:String(r.serviceName||o.serviceName||o.service_name||o.name||'خدمة'),serviceId:String(r.serviceId||o.serviceId||o.service_id||o.sadaServiceId||o.sada_service_id||''),orderStatus:String(o.status||o.orderStatus||o.order_status||'غير معروف'),refundState:String(r.refundState||(normalizeProviderStatus(r.status)==='partial'?'partial_credited':'credited')),link:String(o.link||''),quantity:Number(r.quantity??o.quantity??o.qty??0),originalChargeIQD:charged,originalChargeUSD:Number((charged/FIXED_RATE).toFixed(6)),amountIQD:Math.max(0,Number(r.amountIQD||0)),amountUSD:Number((Number(r.amountIQD||0)/FIXED_RATE).toFixed(6))};}
       rows.sort((a,b)=>(Date.parse(b.createdAt||'')||0)-(Date.parse(a.createdAt||'')||0));const total=rows.reduce((sum,r)=>sum+Math.max(0,Number(r.amountIQD||0)),0);const balanceIQD=Number(user.balance||0);
       return json(res,200,{ok:true,user:username,email:profileEmail,balanceIQD,balanceUSD:Number((balanceIQD/FIXED_RATE).toFixed(6)),totalRefundIQD:total,totalRefundUSD:Number((total/FIXED_RATE).toFixed(6)),refunds:rows.slice(0,500)});
@@ -7495,10 +7577,10 @@ async function routeAPI(req,res,urlObj){
     const q=String(urlObj.searchParams.get('q')||'').trim().toLowerCase();const sort=String(urlObj.searchParams.get('sort')||'balance');const page=Math.max(1,parseInt(urlObj.searchParams.get('page')||'1',10)||1);const limit=Math.max(10,Math.min(100,parseInt(urlObj.searchParams.get('limit')||'50',10)||50));
     let remote=null;let remoteOk=false;try{remote=await firebaseGetJson('users',12000);if(remote!==null&&remote!==undefined&&(typeof remote!=='object'))throw new Error('شكل بيانات users غير متوقع');remoteOk=true}catch(e){if(!DATA_IS_EXTERNAL)return json(res,502,{ok:false,error:'تعذر قراءة أرصدة Firebase بأمان؛ لم نعرض أرقاماً محلية على أنها الأرصدة الحقيقية.',details:String(e.message||e).slice(0,140)})}
     const local=readJSON('users.json',{users:{}}).users||{};const all=new Map();for(const [k,v] of Object.entries(local)){if(v&&typeof v==='object')all.set(k,{...v,username:String(v.username||k),_firebaseKey:'',_source:'local'})}for(const [k,v] of collectionEntries(remote)){if(v&&typeof v==='object'&&!Array.isArray(v)){const username=String(v.username||v.userName||decodeFirebaseSafeKey(k)||k);all.set(username,{...(all.get(username)||{}),...v,username,_firebaseKey:String(k),_source:'firebase'})}}
-    const orderCounts=new Map();let ordersAvailable=true;try{const orderRoot=await firebaseGetJson('orders',10000),orderRows=new Map();for(const o of readJSON('orders.json',[])){if(o&&typeof o==='object'&&!o.event)orderRows.set(String(o.id||o.siteOrderId||o.providerOrderId||o.createdAt||'')+'|'+String(o.user||o.username||'').toLowerCase(),o)}for(const [key,o] of collectionEntries(orderRoot)){if(o&&typeof o==='object'&&!o.event)orderRows.set(String(o.id||o.siteOrderId||o.providerOrderId||o.createdAt||key)+'|'+String(o.user||o.username||'').toLowerCase(),o)}for(const o of orderRows.values()){const u=String(o.user||o.username||'').trim().toLowerCase();if(u)orderCounts.set(u,(orderCounts.get(u)||0)+1)}}catch(_){ordersAvailable=false}
+    let orderCounts=new Map(),ordersAvailable=true,orderAggregate=null;try{orderAggregate=await getFirebaseOrderAggregates();orderCounts=new Map(Object.entries(orderAggregate.countsByUser||{}).map(([u,n])=>[String(u).trim().toLowerCase(),Number(n)||0]));}catch(_){ordersAvailable=false}
     const rows=[...all.values()].map(u=>({username:String(u.username||u.u||''),name:String(u.fullName||u.name||u.username||''),email:String(firebaseRecordEmail(u)||''),balanceIQD:Number(u.balance||0),balanceUSD:Number((Number(u.balance||0)/FIXED_RATE).toFixed(6)),orderCount:ordersAvailable?(orderCounts.get(String(u.username||u.u||'').trim().toLowerCase())||0):null,role:String(u.role||'user'),discountPct:Number(u.discountPct??u.discount??0),banned:isSadaAdminBannedAccount(u),status:String(u.status||u.accountStatus||''),updatedAt:u.updatedAt||u.joined||null,firebaseKey:String(u._firebaseKey||'')})).filter(u=>u.username&&(!q||[u.username,u.name,u.email].join(' ').toLowerCase().includes(q))).sort((a,b)=>sort==='orders'?((Number(b.orderCount)||0)-(Number(a.orderCount)||0)||b.balanceIQD-a.balanceIQD):sort==='balance_asc'?(a.balanceIQD-b.balanceIQD||a.username.localeCompare(b.username,'ar')):(b.balanceIQD-a.balanceIQD||a.username.localeCompare(b.username,'ar')));
     const stats={totalUsers:all.size,withBalance:rows.filter(x=>x.balanceIQD>0).length,totalBalanceIQD:[...all.values()].reduce((sum,u)=>sum+Number(u.balance||0),0),totalBalanceUSD:0};stats.totalBalanceUSD=Number((stats.totalBalanceIQD/FIXED_RATE).toFixed(6));
-    return json(res,200,{ok:true,stats,items:rows.slice((page-1)*limit,page*limit),page,limit,total:rows.length,totalPages:Math.max(1,Math.ceil(rows.length/limit)),source:remoteOk?'firebase':'local-only',warning:(remoteOk?'': 'تنبيه: مصدر Firebase غير متاح؛ بيانات العرض محلية وقد لا تعكس الرصيد الحي.')+(!ordersAvailable?' · تعذر قراءة الطلبات؛ أعداد الطلبات غير متاحة.':'')});
+    return json(res,200,{ok:true,stats,items:rows.slice((page-1)*limit,page*limit),page,limit,total:rows.length,totalPages:Math.max(1,Math.ceil(rows.length/limit)),source:remoteOk?'firebase':'local-only',warning:(remoteOk?'': 'تنبيه: مصدر Firebase غير متاح؛ بيانات العرض محلية وقد لا تعكس الرصيد الحي.')+(!ordersAvailable?' · تعذر قراءة الطلبات؛ أعداد الطلبات غير متاحة.':(orderAggregate?.warning?' · '+orderAggregate.warning:''))});
   }
   if(p==='/api/admin/order-audit/balances/adjust' && req.method==='POST'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
@@ -7520,11 +7602,11 @@ async function routeAPI(req,res,urlObj){
     const testPath='_system/healthChecks/'+id;const probe={id,app:APP_NAME,createdAt:nowISO(),purpose:'connectivity-smoke-test'};
     try{
       const auth=await firebaseAuthContext();
-      const [users,orders,providers]=await Promise.all([firebaseGetJson('users',15000),firebaseGetJson('orders',15000),firebaseGetJson('config/smmProviders',8000)]);const services=readJSON('services.json',{});
+      const [users,orderAggregate,providers]=await Promise.all([firebaseGetJson('users',15000),getFirebaseOrderAggregates(true),firebaseGetJson('config/smmProviders',8000)]);const services=readJSON('services.json',{});
       await firebaseWriteJson(testPath,probe,10000);const check=await firebaseGetJson(testPath,10000);
       if(!check||check.id!==id)throw new Error('كتابة Firebase نجحت ظاهرياً لكن قراءة التحقق فشلت.');
       await firebaseDeleteJson(testPath,10000);const deleted=await firebaseGetJson(testPath,8000);if(deleted!==null)throw new Error('تعذر حذف سجل الاختبار المؤقت من Firebase.');
-      return json(res,200,{ok:true,connected:true,readVerified:true,writeVerified:true,deleteVerified:true,databaseDriver:'rest-oauth',authMode:auth.headers?.Authorization?'service-account-oauth':(auth.queryAuth?'database-secret':'test-only-unauthenticated'),counts:{users:users&&typeof users==='object'?Object.keys(users).length:0,orders:orders&&typeof orders==='object'?Object.keys(orders).length:0,services:services&&typeof services==='object'?Object.keys(services).length:0,providers:providers&&typeof providers==='object'?Object.keys(providers).length:0},checkedAt:nowISO()});
+      return json(res,200,{ok:true,connected:true,readVerified:true,writeVerified:true,deleteVerified:true,databaseDriver:'rest-oauth',authMode:auth.headers?.Authorization?'service-account-oauth':(auth.queryAuth?'database-secret':'test-only-unauthenticated'),counts:{users:users&&typeof users==='object'?Object.keys(users).length:0,orders:orderAggregate.totalOrders,ordersScanned:orderAggregate.scanned,ordersComplete:orderAggregate.complete,services:services&&typeof services==='object'?Object.keys(services).length:0,providers:providers&&typeof providers==='object'?Object.keys(providers).length:0},warning:orderAggregate.warning||'',checkedAt:nowISO()});
     }catch(e){try{await firebaseDeleteJson(testPath,5000)}catch(_){}return json(res,503,{ok:false,connected:false,error:String(e.message||e).slice(0,240),checkedAt:nowISO()});}
   }
   if(p==='/api/admin/firebase/import-catalog'&&req.method==='POST'){
@@ -7897,30 +7979,10 @@ async function routeAPI(req,res,urlObj){
       }
       if(localChanged)writeJSON('orders.json',localRows);
     }
-    // Auto-check unconfirmed provider orders when the user opens/refreshes "My Orders".
-    // A bounded batch and short cooldown prevent repeated provider calls on every page render.
-    const refreshNow=Date.now();let refreshedProviderStatuses=0;
-    const statusCandidates=mergedRows.filter(o=>shouldAutoRefreshProviderOrderStatus(o,refreshNow)).sort((a,b)=>{
-      // Fair rotation: check the least recently checked active order first, so a
-      // busy customer cannot starve older pending/processing orders behind two new ones.
-      const aLast=Date.parse(a.statusSyncLastAttemptAt||a.lastCheckedAt||0)||0;
-      const bLast=Date.parse(b.statusSyncLastAttemptAt||b.lastCheckedAt||0)||0;
-      return aLast-bLast||((Date.parse(a.createdAt||0)||0)-(Date.parse(b.createdAt||0)||0));
-    }).slice(0,1);
-    for(const order of statusCandidates){
-      try{
-        await ensureProviderRuntime(String(order.providerId||''));
-        const provider=getProviderById(String(order.providerId||''),{allowSingleFallback:false}).prov;
-        const checked=await checkAndSyncProviderOrderStatus({...order,_firebaseKey:String(order._k||order.firebaseKey||firebaseKeyById.get(String(order.id||''))||'')},provider,{attempts:1,timeoutMs:3500});
-        Object.assign(order,checked.order||{});
-        if(checked.ok)refreshedProviderStatuses++;
-      }catch(e){
-        const retry=await persistProviderStatusRetryState(order,e.message||e).catch(()=>order);
-        Object.assign(order,retry||{});
-      }
-    }
+    // Provider status is polled by the server background monitor, not by customer page visits.
+    const refreshedProviderStatuses=0;
     const orders=mergedRows.sort((a,b)=>(Date.parse(b.createdAt||0)||0)-(Date.parse(a.createdAt||0)||0)).slice(0,500);
-    return json(res,200,{ok:true,orders,refreshedProviderStatuses,statusRefreshIntervalMs:4000,source:firebaseAvailable?firebaseOrderSource:'hosting-file',warning:warning||undefined});
+    return json(res,200,{ok:true,orders,refreshedProviderStatuses,statusRefreshMode:'server-background',statusRefreshIntervalMs:30000,source:firebaseAvailable?firebaseOrderSource:'hosting-file',warning:warning||undefined});
   }
   if(p==='/api/user/summary' && req.method==='GET'){
     const s=session(req);if(!s||!['user','admin'].includes(s.role))return json(res,401,{ok:false,error:'يجب تسجيل الدخول'});
@@ -8193,7 +8255,7 @@ async function routeAPI(req,res,urlObj){
       resolvedSiteOrderId=String(financialOrder.id||financialOrder.siteOrderId||effectiveSiteOrderId||'');
       const synced=await syncVerifiedOrderStatus(financialOrder,d,normalized);
       if(!synced.ok)return json(res,503,{ok:false,error:'تم فحص حالة المزود لكن تعذر حفظها والتحقق منها في قاعدة البيانات. لم نغيّر الرصيد.',details:synced.error||synced.refund?.error||synced.refund?.reason});
-      return json(res,200,{ok:true,siteOrderId:resolvedSiteOrderId,providerId,providerOrderId,status:String(synced.order?.status||normalized),providerStatus:String(synced.order?.providerStatus||rawProviderStatus||normalized),providerStatusConfirmed:true,normalizedStatus:normalized,remains:d.remains??d?.data?.remains??null,startCount:d.start_count??d.startCount??null,charge:d.charge,currency:d.currency||'USD',refund:synced?.refund||null,checkedAt:synced.checkedAt||checkedAt});
+      return json(res,200,{ok:true,siteOrderId:resolvedSiteOrderId,providerId,providerOrderId,status:String(synced.order?.status||normalized),providerStatus:String(synced.order?.providerStatus||rawProviderStatus||normalized),providerStatusConfirmed:true,normalizedStatus:normalized,remains:synced.order?.remains??d.remains??d?.data?.remains??null,startCount:synced.order?.startCount??d.start_count??d.startCount??null,actualAfterCount:synced.order?.actualAfterCount??null,actualAfterCountSource:synced.order?.actualAfterCountSource||null,actualAfterCountVerifiedAt:synced.order?.actualAfterCountVerifiedAt||null,charge:d.charge,currency:d.currency||'USD',refund:synced?.refund||null,checkedAt:synced.checkedAt||checkedAt});
     }catch(e){return json(res,502,{ok:false,error:e.name==='AbortError'?'انتهت مهلة الاتصال بالمزود':e.message});}
   }
   if(p==='/api/order/cancel' && req.method==='POST'){
@@ -8255,7 +8317,7 @@ async function routeAPI(req,res,urlObj){
     if(!user){try{const people=await firebaseGetQueryJson('users',{orderBy:'\"username\"',equalTo:JSON.stringify(username),limitToLast:5},6000);const match=collectionEntries(people).find(([,u])=>u&&typeof u==='object'&&String(u.username||u.userName||u.user||'').toLowerCase()===username.toLowerCase());if(match){user=match[1];userSource='firebase-indexed';firebaseUserPath='users/'+match[0];}}catch(_) {}}
     const localUsers=readJSON('users.json',{users:{}}).users||{};if(!user){const match=Object.entries(localUsers).find(([k,u])=>k.toLowerCase()===username.toLowerCase()||String(u?.username||u?.userName||u?.user||'').toLowerCase()===username.toLowerCase());if(match){user=match[1];userSource='server-cache';}}
     // Count this user's orders using Firebase's existing indexed user field, not the complete orders root.
-    let remoteOrders=null,ordersError='';try{remoteOrders=await firebaseGetQueryJson('orders',{orderBy:'\"user\"',equalTo:JSON.stringify(username)},10000);}catch(e){ordersError=String(e.message||e).slice(0,160);}
+    let remoteOrders=null,ordersError='';try{remoteOrders=await firebaseGetQueryJson('orders',{orderBy:'\"user\"',equalTo:JSON.stringify(username),limitToLast:500},10000);}catch(e){ordersError=String(e.message||e).slice(0,160);}
     const localOrders=readJSON('orders.json',[]),orderIds=new Set();
     for(const [key,o] of collectionEntries(remoteOrders)){if(!o||typeof o!=='object')continue;if(String(o.user||o.username||'').toLowerCase()!==username.toLowerCase())continue;orderIds.add(String(o.id||o.siteOrderId||o.orderId||key));}
     if(Array.isArray(localOrders))for(const o of localOrders){if(!o||typeof o!=='object'||String(o.user||o.username||'').toLowerCase()!==username.toLowerCase())continue;orderIds.add(String(o.id||o.siteOrderId||o.orderId||''));}
@@ -8285,36 +8347,11 @@ async function routeAPI(req,res,urlObj){
         if(!hits.length){const recent=await firebaseGetQueryJson('orders',{orderBy:'\"$key\"',limitToLast:500},10000);for(const [k,o] of collectionEntries(recent))add(o,k,'firebase');searchMode=qLooksNumeric?'order-number-not-found-in-index':'recent-500-fallback';}
       }
     }catch(e){firebaseAvailable=false;firebaseWarning=String(e.message||e).slice(0,160);}
-    // Reconcile one active provider order per admin refresh. This keeps the admin
-    // queue live without creating a burst of supplier requests when many orders exist.
-    let adminProviderStatusRefreshed=false;
-    if(!rawQ){
-      const candidate=[...merged.entries()].map(([key,order])=>({...order,_firebaseKey:String(order._firebaseKey||order.firebaseKey||order._k||key)}))
-        .filter(order=>!order.legacyHistory&&shouldAutoRefreshProviderOrderStatus(order,Date.now()))
-        .sort((a,b)=>(Date.parse(a.statusSyncLastAttemptAt||a.lastCheckedAt||0)||0)-(Date.parse(b.statusSyncLastAttemptAt||b.lastCheckedAt||0)||0))[0];
-      if(candidate){
-        const lockKey=String(candidate.providerId||'')+'|'+String(candidate.providerOrderId||candidate.smmpartyOrderId||'');
-        globalThis.__SADA_ADMIN_PROVIDER_STATUS_LOCKS=globalThis.__SADA_ADMIN_PROVIDER_STATUS_LOCKS||new Set();
-        const locks=globalThis.__SADA_ADMIN_PROVIDER_STATUS_LOCKS;
-        if(lockKey&&!locks.has(lockKey)){
-          locks.add(lockKey);
-          try{
-            await ensureProviderRuntime(String(candidate.providerId||''));
-            const {prov}=getProviderById(String(candidate.providerId||''),{allowSingleFallback:false});
-            const checked=await checkAndSyncProviderOrderStatus(candidate,prov,{attempts:1,timeoutMs:3500});
-            const updated={...candidate,...(checked.order||{})};
-            const key=keyOf(candidate);if(merged.has(key))merged.set(key,{...merged.get(key),...updated});
-            adminProviderStatusRefreshed=!!checked.ok;
-          }catch(e){
-            const retry=await persistProviderStatusRetryState(candidate,e?.message||e).catch(()=>candidate);
-            const key=keyOf(candidate);if(merged.has(key))merged.set(key,{...merged.get(key),...(retry||{})});
-          }finally{locks.delete(lockKey);}
-        }
-      }
-    }
+    // Supplier status is refreshed by the server background worker, independent of admin page visits.
+    const adminProviderStatusRefreshed=false;
     // This list endpoint deliberately does not load the whole users node; email/profile fields are loaded per-user on demand.
     const rows=[...merged.values()].map(o=>({...o,email:String(o.email||o.userEmail||o.memberEmail||'')})).filter(o=>{const hay=[o.id,o.publicOrderNo,o.publicOrderNumber,o.siteOrderId,o.user,o.username,o.userName,o.name,o.email,o.link,o.serviceName,o.providerOrderId,o.legacyOrderId,o.legacyOrderNumber].map(v=>String(v||'').toLowerCase()).join(' ');const providerRaw=o.providerStatus||o.smmStatus||o.provider_status||'';const hasProvider=!!(o.providerId&& (o.providerOrderId||o.smmpartyOrderId||o.provider_order_id));const providerConfirmed=o.providerStatusConfirmed===true;const rawStatus=String(hasProvider&&!providerConfirmed?'pending':providerConfirmed?(providerRaw||o.status||'pending'):(o.status||providerRaw||'pending')).trim().toLowerCase().replace(/[\s_-]+/g,' ');const norm=(rawStatus==='in progress'||rawStatus==='inprogress')?'in progress':normalizeProviderStatus(rawStatus);const wanted=(st==='in progress'||st==='in_progress')?'in progress':normalizeProviderStatus(st);return (!q||hay.includes(q))&&(!st||st==='all'||norm===wanted);}).sort((a,b)=>(Date.parse(b.createdAt||0)||0)-(Date.parse(a.createdAt||0)||0)).slice(0,500);
-    return json(res,200,{ok:true,orders:rows,firebaseAvailable,warning:firebaseWarning||undefined,searchMode,limit:500,providerStatusRefreshed:adminProviderStatusRefreshed,statusRefreshIntervalMs:4000,readOnlyLegacyCount:rows.filter(x=>x.legacyHistory).length});
+    return json(res,200,{ok:true,orders:rows,firebaseAvailable,warning:firebaseWarning||undefined,searchMode,limit:500,providerStatusRefreshed:adminProviderStatusRefreshed,statusRefreshMode:'server-background',statusRefreshIntervalMs:30000,readOnlyLegacyCount:rows.filter(x=>x.legacyHistory).length});
   }
   if(p==='/api/admin/order-status' && req.method==='POST'){
     if(!isAdmin(req)) return json(res,403,{ok:false,error:'غير مصرح'});
@@ -8359,7 +8396,7 @@ async function routeAPI(req,res,urlObj){
       const resolvedOrder=await resolveFinancialOrder({...order,providerId,providerOrderId,_firebaseKey:order._firebaseKey||order.firebaseKey||''});
       const synced=await syncVerifiedOrderStatus(resolvedOrder,d,normalized);
       if(!synced.ok)return json(res,503,{ok:false,error:'تم فحص المزود لكن تعذر تثبيت الحالة والتحقق من حفظها في قاعدة البيانات؛ لم يُنفذ الاسترداد.',details:synced.error||synced.refund?.error||synced.refund?.reason});
-      return json(res,200,{ok:true,siteOrderId:String(synced.order?.id||synced.order?.siteOrderId||siteId),providerOrderId,status:synced.order.status,providerStatus:synced.order.providerStatus,providerStatusConfirmed:synced.order.providerStatusConfirmed,remains:synced.order.remains,startCount:synced.order.startCount,refund:synced.refund||null,checkedAt:synced.order.lastCheckedAt});
+      return json(res,200,{ok:true,siteOrderId:String(synced.order?.id||synced.order?.siteOrderId||siteId),providerOrderId,status:synced.order.status,providerStatus:synced.order.providerStatus,providerStatusConfirmed:synced.order.providerStatusConfirmed,remains:synced.order.remains,startCount:synced.order.startCount,actualAfterCount:synced.order.actualAfterCount??null,actualAfterCountSource:synced.order.actualAfterCountSource||null,actualAfterCountVerifiedAt:synced.order.actualAfterCountVerifiedAt||null,refund:synced.refund||null,checkedAt:synced.order.lastCheckedAt});
     }catch(e){
       appendJsonLedger('provider_failures.json',{stage:'admin_order_status',siteOrderId:siteId,providerId,providerOrderId,error:String(e.message||e),createdAt:nowISO()});
       return json(res,502,{ok:false,error:String(e.message||e)});
@@ -8576,16 +8613,37 @@ async function routeAPI(req,res,urlObj){
     res.setHeader('X-Sada-Release-Version',APP_VERSION);res.setHeader('X-Sada-Release-Build',BUILD_ID);
     return json(res,deploymentConsistent?200:503,{ok:deploymentConsistent,app:APP_NAME,version:APP_VERSION,buildId:BUILD_ID,uiVersion,uiBuildId,versionFile,buildFile,packageVersion,packageBuild,configVersion,configBuild,deploymentConsistent,htmlSha256:digest,branch:process.env.RAILWAY_GIT_BRANCH||null,commit:process.env.RAILWAY_GIT_COMMIT_SHA||null,checkedAt:new Date().toISOString()});
   }
+let UI_BUILD_META_CACHE={mtimeMs:0,size:0,version:'',buildId:''};
+function readUiBuildMetadata(){
+  const file=path.join(ROOT,'index.html');
+  try{
+    const st=fs.statSync(file);
+    if(UI_BUILD_META_CACHE.mtimeMs===st.mtimeMs&&UI_BUILD_META_CACHE.size===st.size)return UI_BUILD_META_CACHE;
+    const fd=fs.openSync(file,'r'),buf=Buffer.alloc(16384);let bytes=0;
+    try{bytes=fs.readSync(fd,buf,0,buf.length,0);}finally{fs.closeSync(fd);}
+    const head=buf.toString('utf8',0,bytes);
+    const version=head.match(/<meta\s+name=["']sada-version["']\s+content=["']([^"']+)/i)?.[1]||'';
+    const buildId=head.match(/<meta\s+name=["']sada-build-id["']\s+content=["']([^"']+)/i)?.[1]||'';
+    UI_BUILD_META_CACHE={mtimeMs:st.mtimeMs,size:st.size,version:String(version),buildId:String(buildId)};
+  }catch(_){}
+  return UI_BUILD_META_CACHE;
+}
+
+function appMemoryDiagnostics(){
+  const m=process.memoryUsage();const constrained=typeof process.constrainedMemory==='function'?Number(process.constrainedMemory()||0):0;
+  return {rssMB:Number((m.rss/1048576).toFixed(1)),heapUsedMB:Number((m.heapUsed/1048576).toFixed(1)),heapTotalMB:Number((m.heapTotal/1048576).toFixed(1)),externalMB:Number((m.external/1048576).toFixed(1)),arrayBuffersMB:Number((m.arrayBuffers/1048576).toFixed(1)),memoryLimitMB:constrained?Number((constrained/1048576).toFixed(1)):null,staticCacheMB:Number((STATIC_CACHE_BYTES/1048576).toFixed(2)),staticCacheEntries:STATIC_CACHE.size,orderMonitorRows:Number(ORDER_MONITOR_SNAPSHOT_VALUE?.rows?.length||0),providerStatusMonitorRunning:PROVIDER_ORDER_STATUS_MONITOR_RUNNING,providerStatusMonitorLastAt:PROVIDER_ORDER_STATUS_MONITOR_LAST_AT||null,activeHttpRequests:Number(activeHttpRequests||0),maxConcurrentHttpRequests:MAX_CONCURRENT_HTTP_REQUESTS,uptimeSeconds:Math.floor(process.uptime())};
+}
+
   if(p==='/api/health') {
     let uiVersion='', uiBuildId='', versionFile='', buildFile='';
-    try { const html=fs.readFileSync(path.join(ROOT,'index.html'),'utf8'); uiVersion=String(html.match(/<meta\s+name=["']sada-version["']\s+content=["']([^"']+)["']/i)?.[1]||''); uiBuildId=String(html.match(/<meta\s+name=["']sada-build-id["']\s+content=["']([^"']+)["']/i)?.[1]||''); } catch(_) {}
+    const uiMeta=readUiBuildMetadata();uiVersion=uiMeta.version;uiBuildId=uiMeta.buildId;
     try { versionFile=fs.readFileSync(path.join(ROOT,'version.txt'),'utf8').trim(); } catch(_) {}
     try { buildFile=fs.readFileSync(path.join(ROOT,'BUILD_ID.txt'),'utf8').trim(); } catch(_) {}
     let releasePackage={},releaseConfig={};try{releasePackage=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8'))}catch(_){}try{releaseConfig=JSON.parse(fs.readFileSync(path.join(ROOT,'config.json'),'utf8'))}catch(_){}const deploymentConsistent=uiVersion===APP_VERSION&&uiBuildId===BUILD_ID&&versionFile===APP_VERSION&&buildFile===BUILD_ID&&String(releasePackage.version||'').split('.').slice(0,2).join('.')===APP_VERSION&&releasePackage.buildId===BUILD_ID&&releaseConfig.version===APP_VERSION&&releaseConfig.buildId===BUILD_ID;
     const dbInfo=firebaseDatabaseDiagnosticInfo();
     const health={ok:deploymentConsistent,app:APP_NAME,version:APP_VERSION,buildId:BUILD_ID,uiVersion,uiBuildId,versionFile,buildFile,deploymentConsistent,dataStorageMode:DATA_IS_EXTERNAL?'external-directory':'release-local',firebaseUrlConfigured:!!FIREBASE_DATABASE_URL,firebaseDatabaseSource:FIREBASE_DATABASE_URL_SOURCE,firebaseServerAuthConfigured:firebaseAuthAvailable(),firebaseDatabaseDriver:firebaseAdminEnabled()?'admin-sdk':'rest-oauth',priceGuard:PRICE_GUARD_ENABLED,securityPatch:'1.6.91',providerCount:Object.keys(providerStore().providers||{}).length,time:new Date().toISOString(),node:process.version};
     // Keep operational configuration details private; only an authenticated admin can inspect them.
-    if(isAdmin(req)){const credentialStatus=firebaseServiceAccountStatus();health.firebaseDatabase={host:dbInfo.host,source:dbInfo.source,databaseProjectHint:dbInfo.databaseProjectHint,serviceAccountProjectId:dbInfo.serviceAccountProjectId||null,configuredWebProjectId:dbInfo.configuredWebProjectId||null,serviceAccountProjectMatch:dbInfo.serviceAccountProjectMatch};health.securityConfig={sessionSecretConfigured:!!String(process.env.SESSION_SECRET||'').trim(),dedicatedEncryptionKeyConfigured:!!String(process.env.SADA_ENCRYPTION_KEY||'').trim(),stableEncryptionAvailable:telegramEncryptionReady(),firebaseConfigured:!!FIREBASE_DATABASE_URL,firebaseServiceAccountConfigured:credentialStatus.ok,firebaseCredentialStatus:{ok:credentialStatus.ok,code:credentialStatus.code,source:credentialStatus.source,message:credentialStatus.message},firebaseDatabaseSecretConfigured:!!String(process.env.FIREBASE_DATABASE_SECRET||'').trim(),firebaseAuthAvailable:firebaseAuthAvailable(),emailServiceConfigured:!!(String(process.env.RESEND_API_KEY||'').trim()&&String(process.env.RESEND_FROM_EMAIL||process.env.EMAIL_FROM||'').trim()),telegramTokenFromEnvironment:!!String(process.env.TELEGRAM_BOT_TOKEN||'').trim(),adminPasswordFromEnvironment:!!(String(process.env.ADMIN_PASSWORD||'').trim()||String(process.env.ADMIN_PASSWORD_HASH||'').trim()),adminPasswordConfigured:adminPasswordConfigured()};}
+    if(isAdmin(req)){health.memory=appMemoryDiagnostics();const credentialStatus=firebaseServiceAccountStatus();health.firebaseDatabase={host:dbInfo.host,source:dbInfo.source,databaseProjectHint:dbInfo.databaseProjectHint,serviceAccountProjectId:dbInfo.serviceAccountProjectId||null,configuredWebProjectId:dbInfo.configuredWebProjectId||null,serviceAccountProjectMatch:dbInfo.serviceAccountProjectMatch};health.securityConfig={sessionSecretConfigured:!!String(process.env.SESSION_SECRET||'').trim(),dedicatedEncryptionKeyConfigured:!!String(process.env.SADA_ENCRYPTION_KEY||'').trim(),stableEncryptionAvailable:telegramEncryptionReady(),firebaseConfigured:!!FIREBASE_DATABASE_URL,firebaseServiceAccountConfigured:credentialStatus.ok,firebaseCredentialStatus:{ok:credentialStatus.ok,code:credentialStatus.code,source:credentialStatus.source,message:credentialStatus.message},firebaseDatabaseSecretConfigured:!!String(process.env.FIREBASE_DATABASE_SECRET||'').trim(),firebaseAuthAvailable:firebaseAuthAvailable(),emailServiceConfigured:!!(String(process.env.RESEND_API_KEY||'').trim()&&String(process.env.RESEND_FROM_EMAIL||process.env.EMAIL_FROM||'').trim()),telegramTokenFromEnvironment:!!String(process.env.TELEGRAM_BOT_TOKEN||'').trim(),adminPasswordFromEnvironment:!!(String(process.env.ADMIN_PASSWORD||'').trim()||String(process.env.ADMIN_PASSWORD_HASH||'').trim()),adminPasswordConfigured:adminPasswordConfigured()};}
     return json(res,200,health);
   }
   return json(res,404,{error:'API endpoint not found'});
@@ -8594,20 +8652,31 @@ async function routeAPI(req,res,urlObj){
 const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.svg':'image/svg+xml','.json':'application/json; charset=utf-8','.txt':'text/plain; charset=utf-8'};
 const STATIC_CACHE=new Map();
 const STATIC_TEXT_EXTS=new Set(['.html','.js','.css','.svg','.json','.txt','.xml']);
-function staticRecord(file,st,ext,callback){
+const STATIC_CACHE_MAX_BYTES=8*1024*1024;
+const STATIC_CACHE_MAX_ENTRY_BYTES=4*1024*1024;
+let STATIC_CACHE_BYTES=0;
+function removeStaticCacheEntry(key){const old=STATIC_CACHE.get(key);if(old){STATIC_CACHE_BYTES=Math.max(0,STATIC_CACHE_BYTES-Number(old.cacheBytes||0));STATIC_CACHE.delete(key);}}
+function staticRecord(file,st,ext,acceptEncoding,callback){
   const key=file, cached=STATIC_CACHE.get(key);
-  if(cached&&cached.mtimeMs===st.mtimeMs&&cached.size===st.size)return callback(null,cached);
+  if(cached&&cached.mtimeMs===st.mtimeMs&&cached.size===st.size){STATIC_CACHE.delete(key);STATIC_CACHE.set(key,cached);return callback(null,cached);}
+  if(cached)removeStaticCacheEntry(key);
   fs.readFile(file,(err,raw)=>{
     if(err)return callback(err);
     const etag='"'+crypto.createHash('sha1').update(raw).digest('hex')+'"';
-    const record={mtimeMs:st.mtimeMs,size:st.size,etag,lastModified:st.mtime.toUTCString(),raw,br:null,gzip:null};
-    if(STATIC_TEXT_EXTS.has(ext)&&raw.length>=512){
-      try{record.br=zlib.brotliCompressSync(raw,{params:{[zlib.constants.BROTLI_PARAM_QUALITY]:4}})}catch(_){}
-      try{record.gzip=zlib.gzipSync(raw,{level:6})}catch(_){}
+    const record={mtimeMs:st.mtimeMs,size:st.size,etag,lastModified:st.mtime.toUTCString(),raw,compressed:null,cacheBytes:0};
+    // Images and large files are streamed by serveStatic; only small text assets enter this cache.
+    if(STATIC_TEXT_EXTS.has(ext)&&raw.length<=STATIC_CACHE_MAX_ENTRY_BYTES){
+      const ae=String(acceptEncoding||'');
+      try{
+        if(raw.length>=4096&&/(?:^|,\s*)br(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(ae))record.compressed={encoding:'br',body:zlib.brotliCompressSync(raw,{params:{[zlib.constants.BROTLI_PARAM_QUALITY]:3}})};
+        else if(raw.length>=4096&&/(?:^|,\s*)gzip(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(ae))record.compressed={encoding:'gzip',body:zlib.gzipSync(raw,{level:4})};
+      }catch(_){record.compressed=null;}
+      record.cacheBytes=raw.length+Number(record.compressed?.body?.length||0);
+      if(record.cacheBytes<=STATIC_CACHE_MAX_ENTRY_BYTES){
+        STATIC_CACHE.set(key,record);STATIC_CACHE_BYTES+=record.cacheBytes;
+        while(STATIC_CACHE_BYTES>STATIC_CACHE_MAX_BYTES&&STATIC_CACHE.size){removeStaticCacheEntry(STATIC_CACHE.keys().next().value);}
+      }
     }
-    STATIC_CACHE.set(key,record);
-    // Keep the cache bounded for long-lived instances.
-    while(STATIC_CACHE.size>80)STATIC_CACHE.delete(STATIC_CACHE.keys().next().value);
     callback(null,record);
   });
 }
@@ -8618,7 +8687,7 @@ function serveStatic(req,res,urlObj){
     if(m.enabled===true){const escapeHtml=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const title=escapeHtml(m.title||'التطبيق متوقف مؤقتاً'),message=escapeHtml(m.message||'نعتذر عن الإزعاج، التطبيق تحت الصيانة المؤقتة.'),reason=escapeHtml(m.reason||''),image=String(m.imageUrl||'');const imageHtml=/^\/media\/maintenance\/[a-z0-9-]+\.(?:jpg|jpeg|png|webp)$/i.test(image)?'<img alt="" style="max-width:min(88vw,420px);max-height:34vh;object-fit:contain;border-radius:18px;margin:0 auto 20px" src="'+image+'">':'';const html='<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+title+'</title><body style="margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at top,#171d43,#070918 70%);color:#f4f3ff;font-family:system-ui,sans-serif;padding:22px;box-sizing:border-box;text-align:center"><main style="max-width:560px;width:100%;padding:28px;border:1px solid #38336c;border-radius:24px;background:#10152ee8;box-sizing:border-box">'+imageHtml+'<div style="font-size:42px;margin-bottom:10px">🛠️</div><h1 style="font-size:clamp(23px,5vw,32px)">'+title+'</h1><p style="font-size:16px;line-height:2">'+message+'</p>'+(reason?'<p style="font-size:13px;line-height:1.8;color:#aaa9c9">السبب: '+reason+'</p>':'')+'<p style="font-size:11px;color:#8b8caf;margin-top:22px">سنعود للعمل بعد انتهاء الصيانة. شكراً لصبركم.</p><a href="/?admin=1" style="display:inline-block;margin-top:9px;color:#aaa0ff;font-size:11px;text-decoration:none">دخول الإدارة</a></main></body></html>';res.statusCode=200;res.setHeader('Content-Type','text/html; charset=utf-8');res.setHeader('Cache-Control','no-store');res.setHeader('Content-Length',String(Buffer.byteLength(html)));return req.method==='HEAD'?res.end():res.end(html);}
   }
   const mediaMatch=p.match(/^\/media\/(push|maintenance|custom-shop)\/([a-z0-9-]+\.(?:jpg|jpeg|png|webp))$/i);
-  if(mediaMatch){const mediaType=mediaMatch[1].toLowerCase(),folder=mediaType==='push'?'push-media':mediaType==='maintenance'?'maintenance-media':'custom-shop-media',file=mediaMatch[2],full=path.join(DATA,folder,file);return fs.readFile(full,(err,buf)=>{if(err)return json(res,404,{error:'Not found'});res.statusCode=200;res.setHeader('Content-Type',mediaTypeForImage(path.extname(file)));res.setHeader('Cache-Control','public, max-age=3600');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Content-Length',String(buf.length));return req.method==='HEAD'?res.end():res.end(buf);});}
+  if(mediaMatch){const mediaType=mediaMatch[1].toLowerCase(),folder=mediaType==='push'?'push-media':mediaType==='maintenance'?'maintenance-media':'custom-shop-media',file=mediaMatch[2],full=path.join(DATA,folder,file);return fs.stat(full,(err,st)=>{if(err||!st.isFile())return json(res,404,{error:'Not found'});const etag='W/"'+st.size.toString(16)+'-'+Math.floor(st.mtimeMs).toString(16)+'"';res.setHeader('Content-Type',mediaTypeForImage(path.extname(file)));res.setHeader('Cache-Control','public, max-age=3600');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Content-Length',String(st.size));res.setHeader('ETag',etag);if(String(req.headers['if-none-match']||'')===etag){res.statusCode=304;return res.end();}res.statusCode=200;if(req.method==='HEAD')return res.end();const stream=fs.createReadStream(full);stream.on('error',e=>{console.warn('media stream failed:',String(e.message||e).slice(0,100));if(!res.headersSent)json(res,404,{error:'Not found'});else res.destroy(e);});stream.pipe(res);});}
   const bundled=bundledAssetRecord(p);
   if(bundled){res.statusCode=200;res.setHeader('Content-Type',bundled.contentType);res.setHeader('Cache-Control','public, max-age=300, must-revalidate');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Content-Length',String(bundled.buffer.length));res.setHeader('ETag','"'+crypto.createHash('sha1').update(bundled.buffer).digest('hex')+'"');return req.method==='HEAD'?res.end():res.end(bundled.buffer);}
   const baseName=path.posix.basename(p).toLowerCase();
@@ -8630,16 +8699,32 @@ function serveStatic(req,res,urlObj){
   fs.stat(file,(err,st)=>{
     if(err||!st.isFile()) return json(res,404,{error:'Not found'});
     const ext=path.extname(file).toLowerCase();
-    staticRecord(file,st,ext,(readErr,record)=>{
+    const isMainApplicationHtml=ext==='.html'&&path.basename(file).toLowerCase()==='index.html'&&st.size>1024*1024;
+    if(isMainApplicationHtml){
+      const acceptsGzip=/(?:^|,\s*)gzip(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(String(req.headers['accept-encoding']||''));
+      res.setHeader('Content-Type','text/html; charset=utf-8');res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, max-age=0');res.setHeader('CDN-Cache-Control','no-store');res.setHeader('Vary','Accept-Encoding');res.setHeader('X-Content-Type-Options','nosniff');
+      if(req.method==='HEAD'){res.statusCode=200;return res.end();}
+      res.statusCode=200;const stream=fs.createReadStream(file,{highWaterMark:64*1024});
+      stream.on('error',e=>{console.warn('main html stream failed:',String(e.message||e).slice(0,100));if(!res.headersSent)json(res,404,{error:'Not found'});else res.destroy(e)});
+      if(acceptsGzip){res.setHeader('Content-Encoding','gzip');const gzip=zlib.createGzip({level:4,chunkSize:32*1024});gzip.on('error',e=>res.destroy(e));return stream.pipe(gzip).pipe(res);}
+      return stream.pipe(res);
+    }
+    if(!STATIC_TEXT_EXTS.has(ext)||st.size>STATIC_CACHE_MAX_ENTRY_BYTES){
+      const etag='W/"'+st.size.toString(16)+'-'+Math.floor(st.mtimeMs).toString(16)+'"';
+      res.setHeader('Content-Type',MIME[ext]||'application/octet-stream');res.setHeader('Last-Modified',st.mtime.toUTCString());res.setHeader('Cache-Control','public, max-age=300, must-revalidate');res.setHeader('ETag',etag);res.setHeader('Content-Length',String(st.size));
+      if(String(req.headers['if-none-match']||'')===etag){res.statusCode=304;return res.end();}if(req.method==='HEAD'){res.statusCode=200;return res.end();}
+      res.statusCode=200;const stream=fs.createReadStream(file);stream.on('error',e=>{console.warn('static stream failed:',String(e.message||e).slice(0,100));if(!res.headersSent)json(res,404,{error:'Not found'});else res.destroy(e);});return stream.pipe(res);
+    }
+    staticRecord(file,st,ext,req.headers['accept-encoding'],(readErr,record)=>{
       if(readErr)return json(res,404,{error:'Not found'});
       res.setHeader('Content-Type',MIME[ext]||'application/octet-stream');res.setHeader('Last-Modified',record.lastModified);res.setHeader('Vary','Accept-Encoding');
       // Never reuse old application documents, scripts, styles or worker code across releases.
       const forceFresh=['.html','.js','.css','.json','.webmanifest'].includes(ext);
       res.setHeader('Cache-Control',forceFresh?'no-store, no-cache, must-revalidate, max-age=0':'public, max-age=300, must-revalidate');
       if(forceFresh){res.setHeader('CDN-Cache-Control','no-store');res.setHeader('Surrogate-Control','no-store');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}
-      let body=record.raw,encoding='';const ae=String(req.headers['accept-encoding']||'');
-      if(record.br&&/(?:^|,\s*)br(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(ae)){body=record.br;encoding='br';}
-      else if(record.gzip&&/(?:^|,\s*)gzip(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(ae)){body=record.gzip;encoding='gzip';}
+      let body=record.raw,encoding='';const preferred=record.compressed;
+      if(preferred?.body&&/(?:^|,\s*)br(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(String(req.headers['accept-encoding']||''))&&preferred.encoding==='br'){body=preferred.body;encoding='br';}
+      else if(preferred?.body&&/(?:^|,\s*)gzip(?:\s*;q=(?!0(?:\.0*)?)[0-9.]+)?(?:,|$)/i.test(String(req.headers['accept-encoding']||''))&&preferred.encoding==='gzip'){body=preferred.body;encoding='gzip';}
       // Keep validators for media assets only. App code always receives a fresh 200 response.
       const etagKey=encoding||'raw';record.etags=record.etags||{raw:record.etag};
       if(!record.etags[etagKey])record.etags[etagKey]='"'+crypto.createHash('sha1').update(body).digest('hex')+'"';
@@ -8769,7 +8854,7 @@ async function runBundledLegacySeedBootstrap(){
     if(!fs.existsSync(archivePath)&&!fs.existsSync(encryptedPath)){updateStatus({status:'not-included',error:'ملف قاعدة البيانات غير موجود داخل هذا الإصدار.'});return;}
     if(!fs.existsSync(archivePath)&&!String(process.env.SADA_LEGACY_SEED_KEY||'').trim()){updateStatus({status:'waiting-for-key',error:'النسخة المشفرة القديمة تحتاج SADA_LEGACY_SEED_KEY. ارفع إصدار قاعدة البيانات الجديدة لتعمل دون مفتاح منفصل.',needsVariable:'SADA_LEGACY_SEED_KEY'});return;}
     let state=null,remoteUsersIndex=null,remoteTx=null,remoteOrders=null,remoteUsers=null;
-    try{[state,remoteUsersIndex,remoteTx,remoteOrders,remoteUsers]=await Promise.all([firebaseGetJson(LEGACY_IMPORT_STATE_REMOTE_PATH,7000),firebaseGetJson(LEGACY_USERS_REMOTE_PATH,7000),firebaseGetJson(LEGACY_TRANSACTIONS_REMOTE_PATH,7000),firebaseGetJson('orders',18000),firebaseGetJson('users',18000)])}
+    try{[state,remoteUsersIndex,remoteTx,remoteOrders,remoteUsers]=await Promise.all([firebaseGetJson(LEGACY_IMPORT_STATE_REMOTE_PATH,7000),firebaseGetJson(LEGACY_USERS_REMOTE_PATH,7000),firebaseGetJson(LEGACY_TRANSACTIONS_REMOTE_PATH,7000),getFirebaseOrderRowsForMigration(12000),firebaseGetJson('users',18000)])}
     catch(e){updateStatus({status:'firebase-unavailable',error:String(e.message||e).slice(0,160)});return;}
     let loaded;
     try{loaded=parseBundledLegacyArchive();}
@@ -8967,7 +9052,13 @@ async function importProviderCatalogBulk(payload,actor='admin'){
   finally{PROVIDER_CATALOG_BULK_IMPORT_BUSY=false;}
 }
 
+let activeHttpRequests=0;
+const MAX_CONCURRENT_HTTP_REQUESTS=Math.max(6,Math.min(32,Number(process.env.SADA_MAX_CONCURRENT_REQUESTS)||12));
 const server=http.createServer(async (req,res)=>{
+  if(activeHttpRequests>=MAX_CONCURRENT_HTTP_REQUESTS){res.setHeader('Retry-After','3');return json(res,503,{ok:false,code:'server_busy',error:'الخادم يعالج طلبات كثيرة حالياً. أعد المحاولة بعد لحظات.'});}
+  activeHttpRequests++;
+  let released=false;const releaseRequest=()=>{if(released)return;released=true;activeHttpRequests=Math.max(0,activeHttpRequests-1);};
+  res.once('finish',releaseRequest);res.once('close',releaseRequest);
   try{
     res._forwardedProto=String(req.headers['x-forwarded-proto']||'').split(',')[0].trim();
     res.setHeader('X-Sada-Release-Version',APP_VERSION);
@@ -9009,8 +9100,11 @@ if(process.env.SADA_NETLIFY_FUNCTION==='true'){
   Promise.allSettled([hydrateProviderRuntimeFromFirebase(),hydrateTelegramChannelsFromFirebase(),hydrateApiServicesFromFirebase()]).then(()=>{
     // The bundled Base44 dump was removed from this release. Only the explicitly configured Firebase is used.
     if(process.env.NODE_ENV!=='test'){
-      setTimeout(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},3000).unref();
+      setTimeout(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});runProviderOrderStatusMonitor().catch(()=>{});},6000).unref();
+      // Poll one eligible supplier order at a time; the 4-second tick is a scheduler cadence, not a burst.
+      setInterval(()=>{runProviderOrderStatusMonitor().catch(()=>{});},4000).unref();
       setInterval(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},60*1000).unref();
+      setInterval(()=>{const d=appMemoryDiagnostics();const limit=d.memoryLimitMB?d.memoryLimitMB*0.8:450;if(d.rssMB>limit)console.warn('[SADA_MEMORY_PRESSURE]',JSON.stringify(d));},60000).unref();
     }
   });
 });
