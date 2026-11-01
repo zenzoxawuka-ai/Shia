@@ -1,7 +1,7 @@
 {
   "appName": "صدى العراق",
-  "version": "3.2",
-  "buildId": "SADA-3.2-PROVIDER-STATUS-RECONCILE-ADD-SECTION-MODE-PLATFORM-SORT-20261101-R12",
+  "version": "3.0",
+  "buildId": "SADA-3.0-LIVE-PROVIDER-STATUS-REAL-COUNTS-PINNED-CATEGORY-PRICE-SORT-20261101-R13",
   "currency": "USD",
   "exchangeRate": 1250,
   "fixedRecharge": "5000 IQD = 4 USD",

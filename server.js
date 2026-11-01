@@ -44,8 +44,8 @@ function purgeCatalogServiceSnapshots(){
 }
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
-const APP_VERSION = '3.2';
-const BUILD_ID = 'SADA-3.2-PROVIDER-STATUS-RECONCILE-ADD-SECTION-MODE-PLATFORM-SORT-20261101-R12';
+const APP_VERSION = '3.0';
+const BUILD_ID = 'SADA-3.0-LIVE-PROVIDER-STATUS-REAL-COUNTS-PINNED-CATEGORY-PRICE-SORT-20261101-R13';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -537,7 +537,17 @@ function catalogMergeOrder(remoteValue,localValue,metaRoot,servicesRoot){
   const serviceOrders={};
   const buckets=new Set([...Object.keys(catalogObject(remote.services)),...Object.keys(catalogObject(local.services))]);
   for(const bucket of buckets){const arr=[],seen=new Set();for(const v of [...(Array.isArray(local.services?.[bucket])?local.services[bucket]:[]),...(Array.isArray(remote.services?.[bucket])?remote.services[bucket]:[])]){const key=String(v??'');if(key&&!seen.has(key)){seen.add(key);arr.push(key)}}serviceOrders[bucket]=arr;}
-  return canonicalCatalogOrder({categories,services:serviceOrders},metaRoot);
+  const mergeUniqueArrays=(a,b)=>{const out=[],seen=new Set();for(const value of [...(Array.isArray(a)?a:[]),...(Array.isArray(b)?b:[])]){const key=String(value??'');if(key&&!seen.has(key)){seen.add(key);out.push(value)}}return out;};
+  const platforms={};
+  for(const scope of new Set([...Object.keys(catalogObject(remote.platforms)),...Object.keys(catalogObject(local.platforms))])){
+    const r=catalogObject(remote.platforms?.[scope]),l=catalogObject(local.platforms?.[scope]);
+    const services={};for(const bucket of new Set([...Object.keys(catalogObject(r.services)),...Object.keys(catalogObject(l.services))]))services[bucket]=mergeUniqueArrays(l.services?.[bucket],r.services?.[bucket]);
+    platforms[scope]={...r,...l,categories:mergeUniqueArrays(l.categories,r.categories),services,categoryPins:{...catalogObject(r.categoryPins),...catalogObject(l.categoryPins)}};
+  }
+  const sortModes={...catalogObject(remote.sortModes),...catalogObject(local.sortModes)};
+  for(const scope of new Set([...Object.keys(catalogObject(remote.sortModes)),...Object.keys(catalogObject(local.sortModes))]))sortModes[scope]={...catalogObject(remote.sortModes?.[scope]),...catalogObject(local.sortModes?.[scope])};
+  const mergedPins={...catalogObject(remote.categoryPins),...catalogObject(local.categoryPins)};
+  return canonicalCatalogOrder({ ...remote, ...local, categories, services:serviceOrders, allServices:mergeUniqueArrays(local.allServices,remote.allServices), platforms, sortModes, categoryPins:mergedPins },metaRoot);
 }
 async function persistFirebaseCatalogPatch(patch,options={}){
   if(!patch||typeof patch!=='object'||Array.isArray(patch)||!Object.keys(patch).length)return {count:0};
@@ -2558,11 +2568,12 @@ function auditNormalizeRecord(order={},source='firebase',sourceKey=''){
     providerName:String(o.providerName||o.provider||o.smmProviderName||'').trim(),providerId:String(o.providerId||o.provider_id||o.smmProviderId||'').trim(),providerOrderId,
     amountIQD:Number(o.totalIQD??o.totalIqd??o.total_iqd??o.amountIQD??o.amountIqd??o.chargeIQD??o.chargeIqd??o.priceIQD??o.priceIqd??o.amount??NaN),
     lastCheckedAt:o.lastCheckedAt||o.lastChecked||o.providerCheckedAt||null,
+    statusSyncLastAttemptAt:o.statusSyncLastAttemptAt||o.lastCheckedAt||o.lastChecked||null,
     updatedAt:o.updatedAt||o.updated_at||o.lastUpdatedAt||null,
     completedAt:o.completedAt||o.completed_at||o.finishedAt||null,
     cancelledAt:o.cancelledAt||o.cancelled_at||o.cancelAt||null,
     cancelReason:String(o.cancelReason||o.cancellationReason||o.failureReason||o.reason||''),
-    remains:o.remains??null,startCount:o.startCount??o.start_count??null,refundState:String(o.refundState||''),refundAmountIQD:Number(o.refundAmountIQD||0),
+    remains:o.remains??null,startCount:o.startCount??o.start_count??null,endCount:o.endCount??o.end_count??o.afterCount??o.after_count??null,refundState:String(o.refundState||''),refundAmountIQD:Number(o.refundAmountIQD||0),
     source, firebaseKey:source==='firebase'?String(sourceKey||''):'',
     legacyHistory:!!o.legacyHistory, readOnly:!!o.readOnly,
     siteLocalId:source==='server'?String(id||''):'',
@@ -2646,7 +2657,7 @@ async function loadOrderMonitorSnapshot(){
 }
 function auditPublicRecord(row,now=Date.now(),delayHours=3){
   const createdMs=Number(row.createdMs||auditOrderTime(row)||0)||null;const ageMs=createdMs?Math.max(0,now-createdMs):null;const status=auditStatus(row.status||row.rawStatus);
-  return {id:String(row.id||''),siteOrderId:String(row.siteOrderId||row.id||''),publicOrderNo:String((/^\d{1,9}$/.test(String(row.publicOrderNo||''))&&Number(row.publicOrderNo)>=3000)?row.publicOrderNo:(/^\d{1,9}$/.test(String(row.id||''))&&Number(row.id)>=3000?row.id:'')),user:String(row.user||''),userName:String(row.userName||row.user||'—'),email:String(row.email||''),serviceName:String(row.serviceName||'خدمة'),serviceId:String(row.serviceId||''),platform:String(row.platform||auditPlatform(row)),serviceApp:String(row.serviceApp||''),link:String(row.link||''),quantity:Number(row.quantity||0),status,rawStatus:String(row.rawStatus||status),createdAt:row.createdAt||null,createdMs,ageMs,overdue:!row.legacyHistory&&!!(ageMs!==null&&ageMs>delayHours*3600000&&!auditTerminalStatus(status)),providerName:String(row.providerName||'—'),providerId:String(row.providerId||''),providerOrderId:String(row.providerOrderId||''),lastCheckedAt:row.lastCheckedAt||null,updatedAt:row.updatedAt||null,completedAt:row.completedAt||null,cancelledAt:row.cancelledAt||null,cancelReason:String(row.cancelReason||''),remains:row.remains??null,startCount:row.startCount??null,amountUsd:Number.isFinite(row.amountUsd)?row.amountUsd:null,source:String(row.source||''),sourceKey:String(row._firebaseKey||row.firebaseKey||''),legacyHistory:!!row.legacyHistory,readOnly:!!row.legacyHistory||!!row.readOnly,sources:Array.isArray(row._auditSources)?row._auditSources:[row.source].filter(Boolean)};
+  return {id:String(row.id||''),siteOrderId:String(row.siteOrderId||row.id||''),publicOrderNo:String((/^\d{1,9}$/.test(String(row.publicOrderNo||''))&&Number(row.publicOrderNo)>=3000)?row.publicOrderNo:(/^\d{1,9}$/.test(String(row.id||''))&&Number(row.id)>=3000?row.id:'')),user:String(row.user||''),userName:String(row.userName||row.user||'—'),email:String(row.email||''),serviceName:String(row.serviceName||'خدمة'),serviceId:String(row.serviceId||''),platform:String(row.platform||auditPlatform(row)),serviceApp:String(row.serviceApp||''),link:String(row.link||''),quantity:Number(row.quantity||0),status,rawStatus:String(row.rawStatus||status),createdAt:row.createdAt||null,createdMs,ageMs,overdue:!row.legacyHistory&&!!(ageMs!==null&&ageMs>delayHours*3600000&&!auditTerminalStatus(status)),providerName:String(row.providerName||'—'),providerId:String(row.providerId||''),providerOrderId:String(row.providerOrderId||''),lastCheckedAt:row.lastCheckedAt||null,statusSyncLastAttemptAt:row.statusSyncLastAttemptAt||row.lastCheckedAt||null,updatedAt:row.updatedAt||null,completedAt:row.completedAt||null,cancelledAt:row.cancelledAt||null,cancelReason:String(row.cancelReason||''),remains:row.remains??null,startCount:row.startCount??null,endCount:row.endCount??null,amountUsd:Number.isFinite(row.amountUsd)?row.amountUsd:null,source:String(row.source||''),sourceKey:String(row._firebaseKey||row.firebaseKey||''),legacyHistory:!!row.legacyHistory,readOnly:!!row.legacyHistory||!!row.readOnly,sources:Array.isArray(row._auditSources)?row._auditSources:[row.source].filter(Boolean)};
 }
 function auditPageFilter(rows,params,settings){
   const now=Date.now(),delayMs=settings.delayHours*3600000;
@@ -2892,6 +2903,14 @@ async function applyVerifiedOrderRefund(inputOrder={},providerData={},normalized
   const responseState=settledState!=='credited'?settledState:(status==='partial'&&finalTotal>0?'partial_credited':(status==='refunded'?'refunded':'credited'));
   return {ok:true,credited:!!result.credited,state:responseState,amountIQD:Number(result.deltaIQD||0),totalRefundIQD:finalTotal,balanceIQD:Number(result.balanceIQD??transaction.value?.balance??0),currency:'IQD',reason:result.reason||''};
 }
+function providerMetricNumber(data,keys){
+  const roots=[data,data?.data,data?.result,data?.order,data?.data?.order,data?.result?.order].filter(v=>v&&typeof v==='object');
+  for(const root of roots)for(const key of keys){
+    const raw=root[key];if(raw===undefined||raw===null||String(raw).trim()==='')continue;
+    const value=Number(String(raw).replace(/[٬,\s]/g,''));if(Number.isFinite(value)&&value>=0)return value;
+  }
+  return null;
+}
 async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
   const rawStatus=extractProviderStatus(providerData);
   const normalized=normalizeProviderStatus(normalizedStatus||rawStatus);
@@ -2902,8 +2921,10 @@ async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
   const update={providerStatus:providerRaw,providerStatusConfirmed:true,statusSyncState:'confirmed',statusSyncLastAttemptAt:checkedAt,statusSyncAttempts:Math.max(1,Number(full.statusSyncAttempts||0)+1),initialStatusChecked:true,initialStatusError:'',lastCheckedAt:checkedAt,updatedAt:checkedAt,status:normalized};
   const providerRemains=providerData?.remains??providerData?.remaining??providerData?.data?.remains??providerData?.data?.remaining??providerData?.result?.remains??providerData?.result?.remaining;
   if(providerRemains!==undefined)update.remains=providerRemains;
-  const providerStartCount=providerData?.start_count??providerData?.startCount??providerData?.data?.start_count??providerData?.data?.startCount??providerData?.result?.start_count??providerData?.result?.startCount;
-  if(providerStartCount!==undefined)update.startCount=providerStartCount;
+  const providerStartCount=providerMetricNumber(providerData,['start_count','startCount','startcount','initial_count','initialCount']);
+  if(providerStartCount!==null)update.startCount=providerStartCount;
+  const providerEndCount=providerMetricNumber(providerData,['end_count','endCount','after_count','afterCount','final_count','finalCount','current_count','currentCount']);
+  if(providerEndCount!==null)update.endCount=providerEndCount;
 
   const fbKey=String(full._firebaseKey||full.firebaseKey||'').trim();
   // Do not credit a wallet until the provider-confirmed status is durably attached to the canonical Firebase order.
@@ -2915,7 +2936,9 @@ async function syncVerifiedOrderStatus(order,providerData,normalizedStatus){
     const verify=await firebaseGetJson(fbPath,7000);
     const statusVerified=verify&&normalizeProviderStatus(verify.status||'')===normalized;
     const providerVerified=verify&&String(verify.providerStatus||'')===providerRaw&&verify.providerStatusConfirmed===true;
-    if(!statusVerified||!providerVerified)throw new Error('تعذر التحقق من حفظ حالة المزود في سجل الطلب الأساسي.');
+    const startCountVerified=update.startCount===undefined||Number(verify?.startCount)===Number(update.startCount);
+    const endCountVerified=update.endCount===undefined||Number(verify?.endCount)===Number(update.endCount);
+    if(!statusVerified||!providerVerified||!startCountVerified||!endCountVerified)throw new Error('تعذر التحقق من حفظ حالة المزود أو أعداد البداية/النهاية في سجل الطلب الأساسي.');
   }catch(e){
     return {ok:false,saved:false,order:full,refund:null,error:String(e.message||e).slice(0,180)};
   }
@@ -3083,12 +3106,19 @@ async function runProviderRejectionRefundMonitor(){
 }
 
 async function runRefundReconciliationMonitor(){
-  // Check in-flight provider orders at approximately one-minute intervals; cap work per cycle to avoid provider API bursts.
+  // Poll a small fair batch every 15 seconds. Each status is saved only after a recognized provider response and Firebase read-back verification.
   if(runRefundReconciliationMonitor.running)return;runRefundReconciliationMonitor.running=true;
   try{
-    const snapshot=await loadOrderMonitorSnapshot();if(!snapshot.rows?.length)return;const now=Date.now();let examined=0;
-    const candidates=snapshot.rows.filter(r=>r.providerId&&r.providerOrderId&&(['pending','processing'].includes(r.status)||(['cancelled','partial','failed','refunded'].includes(r.status)&&!['credited','partial_credited','refunded','no_refund_due'].includes(String(r.refundState||''))))&&(!r.lastCheckedAt||now-(auditTimestamp(r.lastCheckedAt)||0)>30000)).sort((a,b)=>Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,12);
-    for(const row of candidates){if(examined++>=12)break;try{const full=await resolveFinancialOrder(row);await ensureProviderRuntime(row.providerId);const prov=getProviderById(row.providerId,{allowSingleFallback:false}).prov;if(!prov?.url||!prov?.key)continue;const d=await providerRequest(prov,{action:'status',order:String(row.providerOrderId)},15000);const normalized=normalizeProviderStatus(extractProviderStatus(d));if(normalized==='unknown')continue;await syncVerifiedOrderStatus(full,d,normalized);}catch(e){console.warn('refund/order status monitor:',String(e.message||e).slice(0,120));}}
+    const snapshot=await loadOrderMonitorSnapshot();if(!snapshot.rows?.length)return;const now=Date.now();
+    const candidates=snapshot.rows.filter(r=>r.providerId&&r.providerOrderId&&(['pending','processing'].includes(r.status)||(['cancelled','partial','failed','refunded'].includes(r.status)&&!['credited','partial_credited','refunded','no_refund_due'].includes(String(r.refundState||''))))&&(!r.statusSyncLastAttemptAt||now-(auditTimestamp(r.statusSyncLastAttemptAt)||0)>=12000)).sort((a,b)=>(auditTimestamp(a.statusSyncLastAttemptAt||a.lastCheckedAt)||0)-(auditTimestamp(b.statusSyncLastAttemptAt||b.lastCheckedAt)||0)||Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,3);
+    for(const row of candidates){
+      try{
+        const full=await resolveFinancialOrder(row);await ensureProviderRuntime(row.providerId);const prov=getProviderById(row.providerId,{allowSingleFallback:false}).prov;
+        const checked=await checkAndSyncProviderOrderStatus({...full,_firebaseKey:full._firebaseKey||row._firebaseKey||row.firebaseKey||''},prov,{attempts:1,timeoutMs:5000});
+        if(checked?.order)Object.assign(row,checked.order);
+        else row.statusSyncLastAttemptAt=nowISO();
+      }catch(e){row.statusSyncLastAttemptAt=nowISO();console.warn('refund/order status monitor:',String(e.message||e).slice(0,120));}
+    }
   }catch(e){console.warn('refund reconciliation monitor:',String(e.message||e).slice(0,160));}finally{runRefundReconciliationMonitor.running=false;}
 }
 
@@ -4482,8 +4512,8 @@ function findInternalApiService(id){
   const sid=String(id||'').trim();if(!/^\d{4,}$/.test(sid))return null;
   return internalApiServices().find(x=>String(x.siteServiceId)===sid||serviceRowMatchesSiteId(x,sid))||null;
 }
-function apiOrderPublic(o){return {order_id:String(o.publicOrderNo||o.id||''),internal_order_id:String(o.id||''),status:String(o.status||'pending'),service:String(o.siteServiceId||o.serviceId||''),quantity:Number(o.quantity||0),charge:Number(Number(o.chargeUsd||0).toFixed(6)),chargeUsd:Number(Number(o.chargeUsd||0).toFixed(6)),currency:'USD',remains:o.remains===undefined?null:o.remains,start_count:o.startCount===undefined?null:o.startCount,createdAt:o.createdAt||null};}
-function apiSmmStatus(o){const status=String(o?.status||'pending');return {charge:Number(Number(o?.chargeUsd||0).toFixed(6)),currency:'USD',start_count:o?.startCount??null,status,remains:o?.remains??null,order_id:String(o?.publicOrderNo||o?.id||''),service:String(o?.siteServiceId||o?.serviceId||''),quantity:Number(o?.quantity||0),updatedAt:o?.lastCheckedAt||o?.updatedAt||null};}
+function apiOrderPublic(o){return {order_id:String(o.publicOrderNo||o.id||''),internal_order_id:String(o.id||''),status:String(o.status||'pending'),service:String(o.siteServiceId||o.serviceId||''),quantity:Number(o.quantity||0),charge:Number(Number(o.chargeUsd||0).toFixed(6)),chargeUsd:Number(Number(o.chargeUsd||0).toFixed(6)),currency:'USD',remains:o.remains===undefined?null:o.remains,start_count:o.startCount===undefined?null:o.startCount,end_count:o.endCount===undefined?null:o.endCount,createdAt:o.createdAt||null};}
+function apiSmmStatus(o){const status=String(o?.status||'pending');return {charge:Number(Number(o?.chargeUsd||0).toFixed(6)),currency:'USD',start_count:o?.startCount??null,end_count:o?.endCount??null,status,remains:o?.remains??null,order_id:String(o?.publicOrderNo||o?.id||''),service:String(o?.siteServiceId||o?.serviceId||''),quantity:Number(o?.quantity||0),updatedAt:o?.lastCheckedAt||o?.updatedAt||null};}
 
 function apiScopeAllows(auth,scope){
   const scopes=auth?.record?.scopes;
@@ -4661,7 +4691,8 @@ async function apiStatusForOrder(auth,order){
     const d=await providerRequest(prov,{action:'status',order:String(order.providerOrderId)},20000);const status=extractProviderStatus(d);const normalized=normalizeProviderStatus(status);
     if(!String(status||'').trim()||normalized==='unknown')return {http:502,body:{error:'Provider status response did not contain a recognized status; the saved order was not marked successful.',stage:'provider_status',uncertain:true}};
     const oldStatus=normalizeProviderStatus(order.providerStatusConfirmed===true?order.providerStatus:(order.status||''));
-    let current={...order,providerStatus:String(status||order.providerStatus||''),providerStatusConfirmed:true,status:normalized,lastCheckedAt:nowISO(),updatedAt:nowISO(),providerRaw:safeProviderResponse(d),remains:d?.remains??d?.data?.remains??order.remains,startCount:d?.start_count??d?.startCount??d?.data?.start_count??order.startCount,providerCharge:d?.charge??d?.data?.charge??order.providerCharge,providerCurrency:d?.currency??d?.data?.currency??order.providerCurrency};
+    const apiStartCount=providerMetricNumber(d,['start_count','startCount','startcount','initial_count','initialCount']);const apiEndCount=providerMetricNumber(d,['end_count','endCount','after_count','afterCount','final_count','finalCount','current_count','currentCount']);
+    let current={...order,providerStatus:String(status||order.providerStatus||''),providerStatusConfirmed:true,status:normalized,lastCheckedAt:nowISO(),statusSyncLastAttemptAt:nowISO(),updatedAt:nowISO(),providerRaw:safeProviderResponse(d),remains:d?.remains??d?.data?.remains??order.remains,startCount:apiStartCount??order.startCount,endCount:apiEndCount??order.endCount,providerCharge:d?.charge??d?.data?.charge??order.providerCharge,providerCurrency:d?.currency??d?.data?.currency??order.providerCurrency};
     current=await persistApiOrderUpdate(current);
     let refund=null;if(['cancelled','partial','failed','refunded'].includes(current.status))refund=await applyVerifiedOrderRefund(current,d,current.status);
     if(refund?.state==='credited'){current={...current,refundState:current.status==='partial'?'partial_credited':(current.status==='refunded'?'refunded':'credited'),refundAmountIQD:refund.totalRefundIQD};try{current=await persistApiOrderUpdate(current);}catch(_) {}}
@@ -8118,7 +8149,7 @@ async function routeAPI(req,res,urlObj){
       resolvedSiteOrderId=String(financialOrder.id||financialOrder.siteOrderId||effectiveSiteOrderId||'');
       const synced=await syncVerifiedOrderStatus(financialOrder,d,normalized);
       if(!synced.ok)return json(res,503,{ok:false,error:'تم فحص حالة المزود لكن تعذر حفظها والتحقق منها في قاعدة البيانات. لم نغيّر الرصيد.',details:synced.error||synced.refund?.error||synced.refund?.reason});
-      return json(res,200,{ok:true,siteOrderId:resolvedSiteOrderId,providerId,providerOrderId,status:String(synced.order?.status||normalized),providerStatus:String(synced.order?.providerStatus||rawProviderStatus||normalized),providerStatusConfirmed:true,normalizedStatus:normalized,remains:d.remains??d?.data?.remains??null,startCount:d.start_count??d.startCount??null,charge:d.charge,currency:d.currency||'USD',refund:synced?.refund||null,checkedAt:synced.checkedAt||checkedAt});
+      return json(res,200,{ok:true,siteOrderId:resolvedSiteOrderId,providerId,providerOrderId,status:String(synced.order?.status||normalized),providerStatus:String(synced.order?.providerStatus||rawProviderStatus||normalized),providerStatusConfirmed:true,normalizedStatus:normalized,remains:synced.order?.remains??null,startCount:synced.order?.startCount??null,endCount:synced.order?.endCount??null,charge:d.charge,currency:d.currency||'USD',refund:synced?.refund||null,checkedAt:synced.checkedAt||checkedAt});
     }catch(e){return json(res,502,{ok:false,error:e.name==='AbortError'?'انتهت مهلة الاتصال بالمزود':e.message});}
   }
   if(p==='/api/order/cancel' && req.method==='POST'){
@@ -8257,7 +8288,7 @@ async function routeAPI(req,res,urlObj){
       const resolvedOrder=await resolveFinancialOrder({...order,providerId,providerOrderId,_firebaseKey:order._firebaseKey||order.firebaseKey||''});
       const synced=await syncVerifiedOrderStatus(resolvedOrder,d,normalized);
       if(!synced.ok)return json(res,503,{ok:false,error:'تم فحص المزود لكن تعذر تثبيت الحالة والتحقق من حفظها في قاعدة البيانات؛ لم يُنفذ الاسترداد.',details:synced.error||synced.refund?.error||synced.refund?.reason});
-      return json(res,200,{ok:true,siteOrderId:String(synced.order?.id||synced.order?.siteOrderId||siteId),providerOrderId,status:synced.order.status,providerStatus:synced.order.providerStatus,providerStatusConfirmed:synced.order.providerStatusConfirmed,remains:synced.order.remains,startCount:synced.order.startCount,refund:synced.refund||null,checkedAt:synced.order.lastCheckedAt});
+      return json(res,200,{ok:true,siteOrderId:String(synced.order?.id||synced.order?.siteOrderId||siteId),providerOrderId,status:synced.order.status,providerStatus:synced.order.providerStatus,providerStatusConfirmed:synced.order.providerStatusConfirmed,remains:synced.order.remains,startCount:synced.order.startCount,endCount:synced.order.endCount,refund:synced.refund||null,checkedAt:synced.order.lastCheckedAt});
     }catch(e){
       appendJsonLedger('provider_failures.json',{stage:'admin_order_status',siteOrderId:siteId,providerId,providerOrderId,error:String(e.message||e),createdAt:nowISO()});
       return json(res,502,{ok:false,error:String(e.message||e)});
@@ -8908,7 +8939,8 @@ if(process.env.SADA_NETLIFY_FUNCTION==='true'){
     // The bundled Base44 dump was removed from this release. Only the explicitly configured Firebase is used.
     if(process.env.NODE_ENV!=='test'){
       setTimeout(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},3000).unref();
-      setInterval(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runRefundReconciliationMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},60*1000).unref();
+      setInterval(()=>{runOrderAuditMonitor().catch(()=>{});runTelegramNewOrdersMonitor().catch(()=>{});runProviderRejectionRefundMonitor().catch(()=>{});},60*1000).unref();
+      setInterval(()=>{runRefundReconciliationMonitor().catch(()=>{});},15*1000).unref();
     }
   });
 });
