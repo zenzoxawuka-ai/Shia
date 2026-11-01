@@ -45,7 +45,7 @@ function purgeCatalogServiceSnapshots(){
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
 const APP_VERSION = '3.2';
-const BUILD_ID = 'SADA-3.2-STARTUP-BOOT-WATCHDOG-FIREBASE-DEFER-20261031-R11';
+const BUILD_ID = 'SADA-3.2-ORDER-STATUS-4S-ADMIN-ALERTS-SORT-PAGING-20261101-R13';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -2097,7 +2097,22 @@ async function apiSmm(req,res,urlObj){
   }catch(e){return json(res,502,{error:e.name==='AbortError'?'انتهت مهلة الاتصال بالمزود':String(e.message||'تعذر الاتصال بالمزود'),providerId,providerName:prov.name||providerId});}
 }
 
+function readAdminNotifications(){return readJSON('admin_notifications.json',[]).filter(x=>x&&typeof x==='object');}
+function writeAdminNotifications(rows){writeJSON('admin_notifications.json',Array.isArray(rows)?rows.slice(0,1000):[]);}
+function createAdminNotification(data={}){
+  const orderId=String(data.orderId||''),type=String(data.type||'info'),status=String(data.status||'');
+  const id=String(data.id||('AN'+sha256([type,orderId,status].join('|')).slice(0,24)));
+  const row={id,type,title:String(data.title||'تنبيه جديد').slice(0,160),message:String(data.message||'').slice(0,1200),orderId,status,createdAt:data.createdAt||nowISO(),read:false,url:String(data.url||'')};
+  const rows=readAdminNotifications();if(!rows.some(x=>String(x.id)===id)){rows.unshift(row);writeAdminNotifications(rows);firebaseWriteJson('adminNotifications/'+id,row,4500).catch(()=>{});}
+  return row;
+}
+async function listAdminNotifications(){
+  const local=readAdminNotifications();let remote=[];try{const v=await firebaseGetJson('adminNotifications',4500);if(v&&typeof v==='object')remote=(Array.isArray(v)?v:Object.values(v)).filter(x=>x&&typeof x==='object')}catch(_){}
+  const merged=new Map();for(const n of [...remote,...local])if(n?.id)merged.set(String(n.id),{...merged.get(String(n.id)),...n});
+  const seen=readJSON('admin_notification_seen.json',{});return [...merged.values()].map(n=>({...n,read:!!(n.read||seen[n.id])})).sort((a,b)=>(Date.parse(b.createdAt)||0)-(Date.parse(a.createdAt)||0)).slice(0,500);
+}
 function readNotifications(){ return readJSON('notifications.json',[]); }
+async function listSiteNotifications(){const local=readNotifications();let remote=[];try{const v=await firebaseGetJson('siteNotifications',4500);if(v&&typeof v==='object')remote=(Array.isArray(v)?v:Object.values(v)).filter(x=>x&&typeof x==='object')}catch(_){}const map=new Map();for(const n of [...remote,...local])if(n?.id)map.set(String(n.id),{...map.get(String(n.id)),...sanitizeNotification(n)});return [...map.values()].sort((a,b)=>(Date.parse(b.createdAt)||0)-(Date.parse(a.createdAt)||0)).slice(0,500);}
 function writeNotifications(v){ writeJSON('notifications.json',Array.isArray(v)?v:[]); }
 function readNotificationSeen(){ return readJSON('notification_seen.json',{}); }
 function writeNotificationSeen(v){ writeJSON('notification_seen.json',v&&typeof v==='object'?v:{}); }
@@ -2121,7 +2136,7 @@ async function listUserNotifications(username){
   const merged=new Map();for(const n of [...remote,...local]){if(n?.id)merged.set(String(n.id),{...merged.get(String(n.id)),...n,user});}
   const seen={...(readNotificationSeen()[user]||{})};try{const rs=await firebaseGetJson('userNotificationSeen/'+firebaseSafeKey(user),3000);if(rs&&typeof rs==='object')Object.assign(seen,rs)}catch(_){}
   const own=[...merged.values()].map(n=>({...sanitizeNotification(n),read:!!(n.read||seen[n.id]),user}));
-  const broadcasts=readNotifications().filter(n=>n.active!==false).map(n=>{const clean=sanitizeNotification(n);return {...clean,read:!!seen[clean.id],type:clean.type||'broadcast'};});
+  const broadcasts=(await listSiteNotifications()).filter(n=>n.active!==false).map(n=>{const clean=sanitizeNotification(n);return {...clean,read:!!seen[clean.id],type:clean.type||'broadcast'};});
   return [...own,...broadcasts].sort((a,b)=>(Date.parse(b.createdAt)||0)-(Date.parse(a.createdAt)||0)).slice(0,500);
 }
 
@@ -2974,6 +2989,24 @@ async function persistProviderStatusRetryState(order,error='provider-status-unav
 
 // The same verified status pipeline is used at creation, on the order-history page,
 // and for background retries. Unknown responses/timeouts remain unresolved, never failed.
+function shouldAutoRefreshProviderOrderStatus(order,now=Date.now()){
+  if(!order||typeof order!=='object')return false;
+  const hasProvider=!!(order.providerId&&(order.providerOrderId||order.smmpartyOrderId||order.provider_order_id));
+  if(!hasProvider)return false;
+  const terminal=new Set(['completed','partial','cancelled','failed','refunded']);
+  const confirmed=order.providerStatusConfirmed===true;
+  const siteStatus=normalizeProviderStatus(order.status||'');
+  const providerStatus=normalizeProviderStatus(order.providerStatus||'');
+  // A terminal provider response is settled only when the canonical site status
+  // agrees with it. Older records can contain providerStatus=Completed while the
+  // customer-facing status is still Processing; those mismatches must be reconciled.
+  const siteMatchesProvider=siteStatus===providerStatus||siteStatus.startsWith(providerStatus+'_');
+  if(confirmed&&terminal.has(providerStatus)&&siteMatchesProvider)return false;
+  // Do not age out active orders: a provider may complete an order days later.
+  const last=Date.parse(order.statusSyncLastAttemptAt||order.lastCheckedAt||0)||0;
+  return !last||now-last>=4000;
+}
+
 async function checkAndSyncProviderOrderStatus(order,provider,options={}){
   const providerOrderId=String(order?.providerOrderId||order?.smmpartyOrderId||'').trim();
   if(!providerOrderId||!provider?.url||!provider?.key){
@@ -4007,7 +4040,7 @@ async function runTelegramNewOrdersMonitor(){
     }
     const retryAfterMs=5*60*1000;
     const fresh=(snap.rows||[]).filter(row=>{const key=telegramOrderIdentity({...row,id:row.siteOrderId||row.id||'',user:row.user||row.username||''}),previous=key?seen[key]:null;if(row.legacyHistory||!key||previous?.deploymentBaseline||Number(row.createdMs||0)<Number(st.monitorStartedAt||TELEGRAM_ORDER_MONITOR_BOOT_MS))return false;if(!previous)return true;if(telegramOrderWasDelivered(previous))return false;const last=Date.parse(previous.lastAttemptAt||'')||0;return now-last>=retryAfterMs;}).sort((a,b)=>Number(a.createdMs||0)-Number(b.createdMs||0)).slice(0,25);
-    for(const row of fresh){const key=telegramOrderIdentity({...row,id:row.siteOrderId||row.id||'',user:row.user||row.username||''});const siteId=String(row.siteOrderId||row.id||'');const candidateNo=String(row.publicOrderNo||row.publicOrderNumber||row.orderNumber||(/^(?:[3-9]\d{3}|[1-9]\d{4,8})$/.test(String(row.id||''))?row.id:'')).trim();const visibleNo=/^(?:[3-9]\d{3}|[1-9]\d{4,8})$/.test(candidateNo)?candidateNo:'قيد الترقيم';createUserNotification(row.user||row.username,{type:'order_created',orderId:siteId,status:String(row.status||'pending'),title:'تم استلام طلبك #'+visibleNo,message:'تم استلام طلب '+visibleNo+' لخدمة '+String(row.serviceName||'خدمة')+'، وسيتم تحديث الحالة هنا.',meta:{serviceName:String(row.serviceName||'خدمة'),quantity:Number(row.quantity||0),providerName:String(row.providerName||''),providerOrderId:String(row.providerOrderId||'')}});const r=await notifyTelegramNewOrder({...row,id:siteId,_firebaseKey:row._firebaseKey||row.firebaseKey||'',source:row.source||''},{source:'monitor'});const delivered=!!(r.primaryOk||r.delivered||r.ok||(Array.isArray(r.deliveredTo)&&r.deliveredTo.length));seen[key]={...(seen[key]||{}),lastAttemptAt:nowISO(),attempts:Number(seen[key]?.attempts||0)+1,primaryOk:!!r.primaryOk,adminFallbackDelivered:!!r.fallbackSent||(!r.primaryOk&&delivered),delivered,deliveredTo:Array.isArray(r.deliveredTo)?r.deliveredTo:[],...(delivered?{sentAt:nowISO(),deliveredAt:nowISO()}:{}),source:'monitor',lastError:delivered?'':String(r.description||r.error||'تعذر إرسال إشعار القناة').slice(0,300)};}
+    for(const row of fresh){const key=telegramOrderIdentity({...row,id:row.siteOrderId||row.id||'',user:row.user||row.username||''});const siteId=String(row.siteOrderId||row.id||'');const candidateNo=String(row.publicOrderNo||row.publicOrderNumber||row.orderNumber||(/^(?:[3-9]\d{3}|[1-9]\d{4,8})$/.test(String(row.id||''))?row.id:'')).trim();const visibleNo=/^(?:[3-9]\d{3}|[1-9]\d{4,8})$/.test(candidateNo)?candidateNo:'قيد الترقيم';createUserNotification(row.user||row.username,{type:'order_created',orderId:siteId,status:String(row.status||'pending'),title:'تم استلام طلبك #'+visibleNo,message:'تم استلام طلب '+visibleNo+' لخدمة '+String(row.serviceName||'خدمة')+'، وسيتم تحديث الحالة هنا.',meta:{serviceName:String(row.serviceName||'خدمة'),quantity:Number(row.quantity||0),providerName:String(row.providerName||''),providerOrderId:String(row.providerOrderId||'')}});createAdminNotification({type:'new_order',orderId:siteId,status:String(row.status||'pending'),title:'طلب جديد #'+visibleNo,message:'المستخدم: '+String(row.user||row.username||'—')+' · الخدمة: '+String(row.serviceName||'خدمة')+' · الكمية: '+Number(row.quantity||0).toLocaleString('ar-IQ')});const r=await notifyTelegramNewOrder({...row,id:siteId,_firebaseKey:row._firebaseKey||row.firebaseKey||'',source:row.source||''},{source:'monitor'});const delivered=!!(r.primaryOk||r.delivered||r.ok||(Array.isArray(r.deliveredTo)&&r.deliveredTo.length));seen[key]={...(seen[key]||{}),lastAttemptAt:nowISO(),attempts:Number(seen[key]?.attempts||0)+1,primaryOk:!!r.primaryOk,adminFallbackDelivered:!!r.fallbackSent||(!r.primaryOk&&delivered),delivered,deliveredTo:Array.isArray(r.deliveredTo)?r.deliveredTo:[],...(delivered?{sentAt:nowISO(),deliveredAt:nowISO()}:{}),source:'monitor',lastError:delivered?'':String(r.description||r.error||'تعذر إرسال إشعار القناة').slice(0,300)};}
     if(fresh.length&&Object.keys(seen).length)await persistTelegramOrderState({initialized:true,monitorBuildId:BUILD_ID,monitorStartedAt:Number(st.monitorStartedAt||TELEGRAM_ORDER_MONITOR_BOOT_MS),seen});
   }catch(e){console.warn('Telegram new-order monitor:',String(e.message||e).slice(0,180))}finally{TELEGRAM_ORDER_MONITOR_RUNNING=false;}
 }
@@ -4023,6 +4056,7 @@ async function notifyOrderStatusChange(order, oldStatus, newStatus){
   const statusMessage=['cancelled','failed','refunded'].includes(newStatus)?(refunded?'أكد المزود '+(newStatus==='failed'?'فشل الطلب':newStatus==='refunded'?'استرداد الطلب':'إلغاء الطلب')+'، وأُعيد '+Number(order.refundAmountIQD).toLocaleString('ar-IQ',{maximumFractionDigits:2})+' د.ع إلى رصيدك.':'أكد المزود '+(newStatus==='failed'?'فشل الطلب':newStatus==='refunded'?'استرداد الطلب':'إلغاء الطلب')+'؛ يجري التحقق من إعادة الرصيد.'):(newStatus==='partial'&&refunded?'اكتمل الطلب جزئياً، وتم استرداد '+Number(order.refundAmountIQD).toLocaleString('ar-IQ',{maximumFractionDigits:2})+' د.ع عن الجزء غير المنفذ.':'الخدمة: '+String(order.serviceName||'خدمة')+' · الكمية: '+Number(order.quantity||0).toLocaleString('ar-IQ')+' · الحالة الجديدة: '+(labels[newStatus]||newStatus));
   const statusTitle=['cancelled','failed','refunded'].includes(newStatus)&&refunded?'تم استرجاع رصيد الطلب #'+orderId:'تحديث حالة طلبك #'+orderId;
   createUserNotification(order.user||order.username,{type:'order_status',orderId,status:newStatus,title:statusTitle,message:statusMessage,meta:{serviceName:String(order.serviceName||'خدمة'),quantity:Number(order.quantity||0),providerName:String(order.providerName||''),providerOrderId:String(order.providerOrderId||'')}});
+  createAdminNotification({type:'order_status',orderId,status:newStatus,title:'تحديث حالة طلب #'+(String(order.publicOrderNo||order.id||order.siteOrderId||'')),message:'الخدمة: '+String(order.serviceName||'خدمة')+' · الحالة الجديدة: '+(labels[newStatus]||newStatus)+' · المستخدم: '+String(order.user||order.username||'—')});
   // Orders/status updates stay in the user's in-app notification center; Telegram channels only receive new-order alerts.
   return false;
 }
@@ -5717,10 +5751,13 @@ async function routeAPI(req,res,urlObj){
     const platform=String(b.platform||'').trim();
     const markupPct=Number(b.markupPct);
     const categories=[...new Map((Array.isArray(b.categories)?b.categories:[]).map(x=>String(x??'').trim()).filter(Boolean).map(x=>[normalizeCatalogLabel(x),x])).values()];
+    const categoryMode=String(b.categoryMode||'existing');
     const validPlatforms=new Set(['Instagram','Tiktok','Youtube','Facebook','Telegram','Twitter','Snapchat','Whatsapp','Linkedin','Other']);
     if(!providerId||!providerServiceId)return json(res,422,{ok:false,error:'اختر المزود وأدخل رقم الخدمة لديه.'});
     if(!validPlatforms.has(platform))return json(res,422,{ok:false,error:'اختر منصة صحيحة للخدمة.'});
+    if(!['existing','new'].includes(categoryMode))return json(res,422,{ok:false,error:'حدد هل تريد الإضافة إلى قسم موجود أو إنشاء قسم جديد.'});
     if(!categories.length||categories.length>12)return json(res,422,{ok:false,error:'اختر قسماً واحداً على الأقل، وبحد أقصى 12 قسماً للخدمة الواحدة.'});
+    if(categoryMode==='new'&&categories.length!==1)return json(res,422,{ok:false,error:'إنشاء قسم جديد يقبل اسماً واحداً فقط.'});
     if(!Number.isFinite(markupPct)||markupPct<0||markupPct>5000)return json(res,422,{ok:false,error:'نسبة الربح يجب أن تكون بين 0 و5000 بالمئة.'});
     if(providerServiceId.length>100)return json(res,422,{ok:false,error:'رقم الخدمة طويل أو غير صالح.'});
     try{
@@ -5759,6 +5796,17 @@ async function routeAPI(req,res,urlObj){
       const at=nowISO();
       const serviceRow={...(existingRow||{}),key:serviceKey,fbKey:serviceKey,name:serviceName,app:apps[0]||platform,apps,platforms:apps,serviceApp:platform,servicePlatform:platform,platformsExplicit:true,groups:mergedGroups,categories:mergedGroups,category:mergedGroups[0]||categories[0],providerId,providerName:String(prov.name||providerId),providerServiceId,smmpartyId:providerServiceId,serviceId:providerServiceId,source:'smmparty',sourceProviderId:providerId,providerRateUsd:baseRate,smmRateUsd:baseRate,smmRate:baseRate,sellingUsd,rateUsd:sellingUsd,markupPct,basePrice:Number((baseRate*FIXED_RATE).toFixed(4)),price:Number((sellingUsd*FIXED_RATE).toFixed(4)),min:Math.max(1,Math.floor(Number(found.min||found.minimum||1)||1)),max:Math.max(Math.max(1,Math.floor(Number(found.min||found.minimum||1)||1)),Math.floor(Number(found.max||found.maximum||1000000)||1000000)),desc:description,description,providerDescription:description,refill:!!found.refill,cancel:!!found.cancel,quality:String(found.rawType||found.type||'SMM'),active:existingRow?.active!==false,enabled:existingRow?.enabled!==false,deleted:false,createdAt:existingRow?.createdAt||at,updatedAt:at,updatedBy:String(currentSession?.username||ADMIN_USER)};
       const metaRoot=catalogObject(readJSON('category_meta.json',{}));
+      const labelIdentity=value=>normalizeCatalogLabel(value).normalize('NFKC').replace(/[أإآٱ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه').replace(/[\s._-]+/g,'');
+      const platformAliases={Instagram:['instagram','insta','انستغرام','انستجرام','انستقرام','انستا'],Tiktok:['tiktok','تيكتوك','تيك توك'],Youtube:['youtube','يوتيوب'],Facebook:['facebook','فيسبوك','فيس بوك','فيس'],Telegram:['telegram','تلجرام','تيليجرام','تليجرام','تلغرام'],Twitter:['twitter','تويتر','x','xcom'],Snapchat:['snapchat','سناب','سنابشات','سناب شات'],Whatsapp:['whatsapp','واتساب','واتس اب'],Linkedin:['linkedin','لينكدان','لينكدإن'],Other:['other','اخرى','عام']};
+      const isTargetPlatform=value=>{const v=labelIdentity(value);return (platformAliases[platform]||[]).some(a=>{const k=labelIdentity(a);return v===k||v.includes(k)});};
+      const knownForPlatform=new Map();
+      for(const m of Object.values(metaRoot)){if(!m||typeof m!=='object')continue;const name=String(m.name||'').trim();if(!name)continue;const ps=[...(Array.isArray(m.platforms)?m.platforms:[]),m.platform,m.imagePlatform].filter(Boolean);if(!ps.length||ps.some(isTargetPlatform))knownForPlatform.set(labelIdentity(name),name);}
+      const rowHasPlatform=(row)=>{const vals=[];for(const k of ['apps','platforms','app','platform','serviceApp','servicePlatform','network','site']){const v=row?.[k];if(Array.isArray(v))vals.push(...v);else if(v)vals.push(v);}if(vals.length)return vals.some(isTargetPlatform);return catalogRowGroups(row).some(group=>{const meta=Object.values(metaRoot).find(m=>labelIdentity(m?.name||'')===labelIdentity(group));const ps=[...(Array.isArray(meta?.platforms)?meta.platforms:[]),meta?.platform,meta?.imagePlatform].filter(Boolean);return ps.some(isTargetPlatform);});};
+      for(const row of Object.values(servicesRoot)){if(!row||typeof row!=='object'||row.deleted===true||!rowHasPlatform(row))continue;for(const group of catalogRowGroups(row))knownForPlatform.set(labelIdentity(group),group);}
+      if(categoryMode==='existing'){
+        const missing=categories.filter(name=>!knownForPlatform.has(labelIdentity(name)));
+        if(missing.length)return json(res,422,{ok:false,error:'الأقسام التالية غير موجودة في المنصة المحددة: '+missing.join('، ')+'. اختر «إنشاء قسم جديد» إذا كنت تريد إنشاءها.'});
+      }else if(knownForPlatform.has(labelIdentity(categories[0])))return json(res,409,{ok:false,error:'هذا القسم موجود بالفعل ضمن المنصة المحددة. اختر «إضافة إلى قسم موجود» بدلاً من إنشاء قسم مكرر.'});
       const metaUpdates={};
       for(const name of categories){
         const nk=normalizeCatalogLabel(name);
@@ -5786,7 +5834,7 @@ async function routeAPI(req,res,urlObj){
       const applied=catalogApplyBatch(updates);if(!applied.ok)return json(res,422,{ok:false,error:applied.error||'تعذر تجهيز بيانات الخدمة.'});
       try{await persistCatalogBatchToFirebase(updates);await firebaseWriteJson('settings/svcsVersion',String(Date.now()),8000);CATALOG_SNAPSHOT_CACHE.clear();purgeCatalogServiceSnapshots();}
       catch(e){try{await reloadLocalCatalogFromFirebase()}catch(reloadError){console.error('Provider service add rollback reload failed:',String(reloadError.message||reloadError))}return json(res,503,{ok:false,persisted:false,verified:false,error:'لم يتم تأكيد إضافة الخدمة في Firebase؛ لم نعلن نجاحها. '+String(e.message||e).slice(0,180)});}
-      return json(res,200,{ok:true,persisted:true,verified:true,created:!existingRow,serviceKey,serviceName,providerId,providerName:String(prov.name||providerId),providerServiceId,categories:mergedGroups.filter(name=>categories.some(c=>normalizeCatalogLabel(c)===normalizeCatalogLabel(name))),platform,providerRateUsd:baseRate,sellingUsd,markupPct,message:existingRow?'تم تحديث الخدمة وربطها بالأقسام المختارة.':'تمت إضافة الخدمة الحقيقية من المزود وربطها بالأقسام المختارة.'});
+      return json(res,200,{ok:true,persisted:true,verified:true,created:!existingRow,categoryMode,serviceKey,serviceName,providerId,providerName:String(prov.name||providerId),providerServiceId,categories:mergedGroups.filter(name=>categories.some(c=>normalizeCatalogLabel(c)===normalizeCatalogLabel(name))),platform,providerRateUsd:baseRate,sellingUsd,markupPct,message:existingRow?'تم تحديث الخدمة وربطها بالأقسام المختارة.':'تمت إضافة الخدمة الحقيقية من المزود وربطها بالأقسام المختارة.'});
     }catch(e){return json(res,502,{ok:false,persisted:false,verified:false,error:'تعذر التحقق من الخدمة أو إضافتها: '+String(e.message||e).slice(0,200)});}
   }
   if(p==='/api/admin/free-services'&&req.method==='POST'){
@@ -5937,6 +5985,33 @@ async function routeAPI(req,res,urlObj){
     }catch(e){
       return json(res,503,{ok:false,error:'تعذر تحميل لقطة الخدمات والأقسام الموثوقة من Firebase: '+String(e.message||e).slice(0,200),source:'firebase',storageMode:'firebase'});
     }finally{if(ownsPending&&CATALOG_SNAPSHOT_IN_FLIGHT.get(cacheKey)===pending)CATALOG_SNAPSHOT_IN_FLIGHT.delete(cacheKey);}
+  }
+
+  if(p==='/api/catalog/sort-snapshot'&&req.method==='GET'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const platform=String(urlObj.searchParams.get('platform')||'').trim().toLowerCase();
+    const allowed=new Set(['all','instagram','tiktok','youtube','facebook','telegram','twitter','snapchat','whatsapp','linkedin','other']);
+    if(!allowed.has(platform))return json(res,422,{ok:false,error:'اختر منصة صحيحة قبل جلب الترتيب.'});
+    const cache=CATALOG_SNAPSHOT_CACHE.get('admin:approved');
+    let fullValue=cache&&Date.now()-cache.at<4500?cache.payload?.value:null;
+    if(!fullValue){
+      try{
+        await ensureLocalServiceCatalogSeeded();await ensureAdminFreeServicesDurable();ensureNumericSiteServiceIds();
+        const allServices=catalogObject(catalogReadPath('services').value),services=Object.fromEntries(Object.entries(allServices).filter(([,row])=>row&&typeof row==='object'&&row.unapprovedAutoImport!==true));
+        for(const [key,row] of Object.entries(readAdminFreeServices()))if(row&&row.adminFreeService===true&&row.enabled!==false&&row.deleted!==true)services[key]={...row,fbKey:key,adminFreeServiceKey:key};
+        for(const [key,row] of Object.entries(readAdminManualServices()))if(row&&row.serviceKind==='manual_support'&&row.enabled!==false&&row.deleted!==true)services[key]=adminManualServicePublic(row,key);
+        fullValue={services,categoryMeta:catalogObject(catalogReadPath('categoryMeta').value),catalogOrder:catalogObject(readJSON('catalog_settings.json',{}).catalogOrder)};
+      }catch(e){return json(res,503,{ok:false,error:'تعذر جلب بيانات الترتيب من Firebase: '+String(e.message||e).slice(0,180)});}
+    }
+    const aliases={instagram:['instagram','insta','انستغرام','انستجرام','انستقرام','انستا'],tiktok:['tiktok','تيكتوك','تيك توك'],youtube:['youtube','يوتيوب'],facebook:['facebook','فيسبوك','فيس بوك','فيس'],telegram:['telegram','تلجرام','تيليجرام','تليجرام','تلغرام'],twitter:['twitter','تويتر','x','xcom'],snapchat:['snapchat','سناب','سنابشات','سناب شات'],whatsapp:['whatsapp','واتساب','واتس اب'],linkedin:['linkedin','لينكدان','لينكدإن'],other:['other','اخرى','عام']};
+    const keyOf=value=>String(value??'').trim().toLocaleLowerCase('ar').normalize('NFKC').replace(/[أإآٱ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه').replace(/[\s._-]+/g,'');
+    const platformOf=value=>{const key=keyOf(value);for(const [id,values] of Object.entries(aliases))if(values.some(alias=>keyOf(alias)===key||key.includes(keyOf(alias))))return id;return 'other';};
+    const metaRoot=fullValue.categoryMeta&&typeof fullValue.categoryMeta==='object'?fullValue.categoryMeta:{},sourceServices=fullValue.services&&typeof fullValue.services==='object'?fullValue.services:{};
+    const matched=Object.entries(sourceServices).filter(([,row])=>{if(platform==='all')return true;const values=[];for(const field of ['apps','platforms','app','platform','serviceApp','servicePlatform','network','site']){const value=row?.[field];if(Array.isArray(value))values.push(...value);else if(value)values.push(value);}if(values.length)return values.some(value=>platformOf(value)===platform);const groups=catalogRowGroups(row);return groups.some(group=>{const m=Object.values(metaRoot).find(meta=>keyOf(meta?.name||'')===keyOf(group))||metaRoot[normalizeCatalogKey(group)]||{};return [...(Array.isArray(m.platforms)?m.platforms:[]),m.platform,m.imagePlatform].filter(Boolean).some(value=>platformOf(value)===platform);});});
+    const services=Object.fromEntries(matched),groupKeys=new Set();for(const [,row] of matched)for(const group of catalogRowGroups(row))groupKeys.add(keyOf(group));
+    const categoryMeta=Object.fromEntries(Object.entries(metaRoot).filter(([key,meta])=>{const name=String(meta?.name||key),platformValues=[...(Array.isArray(meta?.platforms)?meta.platforms:[]),meta?.platform,meta?.imagePlatform].filter(Boolean);const linked=Array.isArray(meta?.serviceKeys)&&meta.serviceKeys.some(serviceKey=>Object.prototype.hasOwnProperty.call(services,String(serviceKey)));return platform==='all'||groupKeys.has(keyOf(name))||linked||platformValues.some(value=>platformOf(value)===platform);}));
+    const order=fullValue.catalogOrder&&typeof fullValue.catalogOrder==='object'?fullValue.catalogOrder:{categories:[],services:{},platforms:{},sortModes:{}};
+    return json(res,200,{ok:true,value:{services,categoryMeta,catalogOrder:{...order,categories:Array.isArray(order.categories)?order.categories:[],services:catalogObject(order.services),platforms:catalogObject(order.platforms),sortModes:catalogObject(order.sortModes)}},platform,counts:{services:Object.keys(services).length,categories:Object.keys(categoryMeta).length},source:'firebase',storageMode:'firebase-filtered-platform'});
   }
 
   if(p==='/api/catalog'&&req.method==='GET'){
@@ -7727,15 +7802,15 @@ async function routeAPI(req,res,urlObj){
     const current=session(req);if(!current||!['user','admin'].includes(String(current.role||'')))return json(res,401,{ok:false,error:'سجّل الدخول لتفعيل إشعارات الهاتف.'});
     const b=await bodyJSON(req),token=String(b.token||'').trim();if(token.length<80||token.length>8192)return json(res,422,{ok:false,error:'رمز إشعارات الهاتف غير صالح.'});
     const all=readJSON('push_tokens.json',{});const username=String(current.username||'').trim();if(!username)return json(res,401,{ok:false,error:'تعذر تحديد الحساب الحالي.'});
-    const id=sha256(token);all[username]=all[username]&&typeof all[username]==='object'?all[username]:{};all[username][id]={token,updatedAt:nowISO(),platform:String(b.platform||'web').slice(0,30),userAgent:String(req.headers['user-agent']||'').slice(0,180)};writeJSON('push_tokens.json',all);
-    return json(res,200,{ok:true,saved:true,message:'تم تسجيل هذا الجهاز لاستقبال الإشعارات. يمكن لهذا الجهاز استقبالها بعد منح إذن المتصفح.'});
+    const id=sha256(token),pushRow={token,updatedAt:nowISO(),platform:String(b.platform||'web').slice(0,30),userAgent:String(req.headers['user-agent']||'').slice(0,180)};all[username]=all[username]&&typeof all[username]==='object'?all[username]:{};all[username][id]=pushRow;writeJSON('push_tokens.json',all);let firebaseSaved=false;try{await firebaseWriteJson('pushTokensByUser/'+firebaseSafeKey(username)+'/'+id,pushRow,4500);firebaseSaved=true}catch(_){}
+    return json(res,200,{ok:true,saved:true,firebaseSaved,storageMode:DATA_IS_EXTERNAL?'persistent-volume':'release-local',message:'تم تسجيل هذا الجهاز لاستقبال الإشعارات.'});
   }
   if(p==='/api/admin/notifications/push'&&req.method==='POST'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
     const b=await bodyJSON(req,4*1024*1024),title=String(b.title||'').trim().slice(0,120),message=String(b.message||'').trim().slice(0,1200),link=String(b.url||'').trim();
     if(!title||!message)return json(res,422,{ok:false,error:'عنوان الإشعار ونصه مطلوبان.'});
     if(link&&(!/^https:\/\//i.test(link)||link.length>1500))return json(res,422,{ok:false,error:'رابط الإشعار يجب أن يكون HTTPS صالحاً.'});
-    const registry=readJSON('push_tokens.json',{}),entries=[];for(const [username,map] of Object.entries(registry||{})){if(!map||typeof map!=='object')continue;for(const [hash,row] of Object.entries(map)){const token=String(row?.token||'').trim();if(token)entries.push({username,hash,token});}}
+    const registry=readJSON('push_tokens.json',{});try{const remoteTokens=await firebaseGetJson('pushTokensByUser',4500);if(remoteTokens&&typeof remoteTokens==='object')for(const [user,map] of Object.entries(remoteTokens)){if(!map||typeof map!=='object')continue;registry[user]=registry[user]&&typeof registry[user]==='object'?registry[user]:{};for(const [hash,row] of Object.entries(map)){if(row?.token)registry[user][hash]={...registry[user][hash],...row}}}}catch(_){}const entries=[];for(const [username,map] of Object.entries(registry||{})){if(!map||typeof map!=='object')continue;for(const [hash,row] of Object.entries(map)){const token=String(row?.token||'').trim();if(token)entries.push({username,hash,token});}}
     const unique=[...new Map(entries.map(x=>[x.token,x])).values()];if(!unique.length)return json(res,409,{ok:false,error:'لا توجد أجهزة سجلت موافقتها على إشعارات الهاتف بعد. على المستخدمين تفعيلها من صفحة الإشعارات أولاً.'});
     if(!firebaseServiceAccountConfigured())return json(res,503,{ok:false,error:'اعتماد Firebase Admin غير مضبوط وصالح؛ لم تُرسل أي إشعارات.'});
     let imageUrl='';const dataUrl=String(b.imageData||'');
@@ -7747,17 +7822,49 @@ async function routeAPI(req,res,urlObj){
     return json(res,report.successCount?200:502,{ok:report.successCount>0,title,targetDevices:unique.length,...report,storageMode:DATA_IS_EXTERNAL?'persistent-volume':'release-local',warning:!DATA_IS_EXTERNAL?'تأكد من ربط Railway Volume حتى تُحفظ صور الإشعارات ورموز الأجهزة بعد إعادة النشر.':'',message:report.successCount?'تم تسليم الإشعار إلى خدمة Firebase للأجهزة المسجلة. هذا لا يضمن عرض كل جهاز إذا كان إذن النظام معطلاً.':'لم تؤكد Firebase تسليم الإشعار لأي جهاز؛ راجع أخطاء الإرسال.'});
   }
   if(p==='/api/admin/notifications' && req.method==='GET'){
-    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'}); return json(res,200,{ok:true,notifications:readNotifications().map(sanitizeNotification)});
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'}); return json(res,200,{ok:true,notifications:(await listSiteNotifications()).map(sanitizeNotification)});
   }
   if(p==='/api/admin/notifications' && req.method==='POST'){
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'}); const b=await bodyJSON(req); const title=String(b.title||'').trim(), message=String(b.message||'').trim(), url=String(b.url||'').trim();
     if(!title||!message)return json(res,422,{ok:false,error:'العنوان والنص مطلوبان'});
     const requestedType=String(b.type||'').trim();const type=['broadcast','required','temporary_page'].includes(requestedType)?requestedType:(b.required?'required':'broadcast');
     const rawDelay=Number(b.delaySeconds===undefined?5:b.delaySeconds);if(type==='temporary_page'&&(!Number.isInteger(rawDelay)||rawDelay<1||rawDelay>600))return json(res,422,{ok:false,error:'مدة الإشعار المؤقت يجب أن تكون بين ثانية و600 ثانية'});
-    const all=readNotifications(); const n=sanitizeNotification({id:notifId(),title:title.slice(0,160),message:message.slice(0,3000),url:url.slice(0,1000),type,delaySeconds:type==='temporary_page'?rawDelay:undefined,required:type==='required'||(requestedType===''&&!!b.required),active:b.active!==false,createdAt:new Date().toISOString()}); all.unshift(n); writeNotifications(all.slice(0,500)); return json(res,200,{ok:true,notification:n});
+    const all=readNotifications(); const n=sanitizeNotification({id:notifId(),title:title.slice(0,160),message:message.slice(0,3000),url:url.slice(0,1000),type,delaySeconds:type==='temporary_page'?rawDelay:undefined,required:type==='required'||(requestedType===''&&!!b.required),active:b.active!==false,createdAt:new Date().toISOString()}); all.unshift(n); writeNotifications(all.slice(0,500));let firebaseSaved=false;try{await firebaseWriteJson('siteNotifications/'+n.id,n,5000);const verify=await firebaseGetJson('siteNotifications/'+n.id,3500);firebaseSaved=!!verify&&String(verify.id)===n.id}catch(e){if(!DATA_IS_EXTERNAL){writeNotifications(all.filter(x=>String(x.id)!==n.id));return json(res,503,{ok:false,error:'تعذر تثبيت الإشعار في Firebase أو تخزين دائم. لم نعلن نجاح النشر.'})}}return json(res,200,{ok:true,notification:n,persistedRemotely:firebaseSaved,warning:firebaseSaved?'':(DATA_IS_EXTERNAL?'حُفظ الإشعار في Railway Volume لكن تعذرت مزامنته مع Firebase.':'')});
   }
   if(p==='/api/admin/notifications' && req.method==='PATCH'){
-    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'}); const b=await bodyJSON(req); const all=readNotifications(); const i=all.findIndex(x=>String(x.id)===String(b.id)); if(i<0)return json(res,404,{ok:false,error:'الإشعار غير موجود'}); if(b.action==='delete')all.splice(i,1); else {all[i]={...sanitizeNotification(all[i]),...(b.active!==undefined?{active:!!b.active}:{}),...(b.required!==undefined?{required:!!b.required}:{}),updatedAt:new Date().toISOString()};} writeNotifications(all); return json(res,200,{ok:true});
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'}); const b=await bodyJSON(req); const all=readNotifications(); const i=all.findIndex(x=>String(x.id)===String(b.id)); if(i<0)return json(res,404,{ok:false,error:'الإشعار غير موجود'}); const changedId=String(all[i].id);if(b.action==='delete')all.splice(i,1); else {all[i]={...sanitizeNotification(all[i]),...(b.active!==undefined?{active:!!b.active}:{}),...(b.required!==undefined?{required:!!b.required}:{}),updatedAt:new Date().toISOString()};} writeNotifications(all);let firebaseSaved=false;try{await firebaseWriteJson('siteNotifications/'+changedId,b.action==='delete'?null:all.find(x=>String(x.id)===changedId),4500);firebaseSaved=true}catch(_){}if(!firebaseSaved&&!DATA_IS_EXTERNAL)return json(res,503,{ok:false,error:'تم تحديث النسخة المحلية لكن تعذر تثبيت التغيير في Firebase. لم نؤكد التعديل الدائم.'});return json(res,200,{ok:true,persistedRemotely:firebaseSaved});
+  }
+  if(p==='/api/admin/alerts'&&req.method==='GET'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const rows=await listAdminNotifications(),all=urlObj.searchParams.get('all')==='1';
+    return json(res,200,{ok:true,notifications:all?rows:rows.filter(x=>!x.read),unreadCount:rows.filter(x=>!x.read).length,checkedAt:nowISO()});
+  }
+  if(p==='/api/admin/alerts/seen'&&req.method==='POST'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const b=await bodyJSON(req),id=String(b.id||'');if(!id)return json(res,422,{ok:false,error:'معرف الإشعار مطلوب'});
+    const seen=readJSON('admin_notification_seen.json',{});seen[id]=nowISO();writeJSON('admin_notification_seen.json',seen);
+    firebaseWriteJson('adminNotificationSeen/'+id,seen[id],3500).catch(()=>{});
+    const rows=readAdminNotifications(),idx=rows.findIndex(x=>String(x.id)===id);if(idx>=0){rows[idx]={...rows[idx],read:true,readAt:seen[id]};writeAdminNotifications(rows);firebaseWriteJson('adminNotifications/'+id,rows[idx],3500).catch(()=>{});}
+    return json(res,200,{ok:true});
+  }
+  if(p==='/api/admin/notifications/status'&&req.method==='GET'){
+    if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح'});
+    const registry=readJSON('push_tokens.json',{}),username=String(session(req)?.username||'');
+    let adminRemoteTokens={};try{const remote=await firebaseGetJson('pushTokensByUser/'+firebaseSafeKey(username),4500);if(remote&&typeof remote==='object')adminRemoteTokens=remote;}catch(_){}
+    const localAdmin=registry[username]&&typeof registry[username]==='object'?registry[username]:{};
+    const adminTokenMap={...adminRemoteTokens,...localAdmin};
+    const adminTokens=[...new Set(Object.values(adminTokenMap).map(x=>String(x?.token||'').trim()).filter(Boolean))].length;
+    const tokens=Object.values(registry||{}).reduce((n,map)=>n+(map&&typeof map==='object'?Object.values(map).filter(x=>String(x?.token||'').trim()).length:0),0);
+    const tg=telegramConfig();return json(res,200,{ok:true,push:{registeredDevices:tokens,adminRegisteredDevices:adminTokens,adminFirebaseDevices:Object.values(adminRemoteTokens).filter(x=>String(x?.token||'').trim()).length,vapidConfigured:!!String(process.env.FIREBASE_WEB_PUSH_VAPID_KEY||'').trim(),serviceAccountConfigured:firebaseServiceAccountConfigured(),persistentStorage:!!DATA_IS_EXTERNAL},telegram:{enabled:!!tg.enabled,tokenSet:!!tg.token,tokenSource:tg.tokenSource,adminChatConfigured:!!tg.adminChat,channelChatConfigured:!!tg.activationChat,overdueChatConfigured:!!tg.overdueChat},checkedAt:nowISO()});
+  }
+  if(p==='/api/admin/notifications/test-push'&&req.method==='POST'){
+    const current=session(req);if(!current||current.role!=='admin')return json(res,403,{ok:false,error:'غير مصرح'});
+    const registry=readJSON('push_tokens.json',{});try{const remote=await firebaseGetJson('pushTokensByUser/'+firebaseSafeKey(String(current.username||'')),4500);if(remote&&typeof remote==='object')registry[String(current.username||'')]={...(registry[String(current.username||'')]||{}),...remote};}catch(_){}const map=registry[String(current.username||'')]||{},tokens=[...new Set(Object.values(map).map(x=>String(x?.token||'').trim()).filter(Boolean))];
+    if(!tokens.length)return json(res,409,{ok:false,error:'هذا الحساب لم يسجل جهازاً لإشعارات الهاتف. اضغط «تفعيل إشعارات هذا الجهاز» من جرس الإدارة أولاً.'});
+    if(!firebaseServiceAccountConfigured())return json(res,503,{ok:false,error:'اعتماد Firebase Admin غير مضبوط؛ لا يمكن إرسال Push.'});
+    try{const messaging=firebaseAdminMessaging();const result=await messaging.sendEachForMulticast({tokens,notification:{title:'اختبار إشعارات صدى العراق',body:'وصل الاختبار من خادم صدى العراق بنجاح.'},data:{url:publicBaseUrl(req),title:'اختبار إشعارات صدى العراق',body:'وصل الاختبار من خادم صدى العراق بنجاح.'},webpush:{fcmOptions:{link:publicBaseUrl(req)}}});
+      return json(res,result.successCount?200:502,{ok:result.successCount>0,targetDevices:tokens.length,successCount:result.successCount,failureCount:result.failureCount,errors:result.responses.filter(x=>!x.success).slice(0,5).map(x=>String(x.error?.code||x.error?.message||'FCM error').slice(0,140)),message:result.successCount?'Firebase أكد تسليم اختبار الإشعار إلى خدمة FCM للأجهزة المسجلة.':'لم تؤكد Firebase تسليم الاختبار لأي جهاز.'});
+    }catch(e){return json(res,502,{ok:false,error:String(e.message||e).slice(0,200)});}
   }
   if(p==='/api/notifications' && req.method==='GET'){
     const s=session(req); if(!s||s.role!=='user')return json(res,401,{ok:false,error:'يجب تسجيل الدخول'});
@@ -7793,21 +7900,13 @@ async function routeAPI(req,res,urlObj){
     // Auto-check unconfirmed provider orders when the user opens/refreshes "My Orders".
     // A bounded batch and short cooldown prevent repeated provider calls on every page render.
     const refreshNow=Date.now();let refreshedProviderStatuses=0;
-    const terminalProviderStatuses=new Set(['completed','partial','cancelled','failed','refunded']);
-    const statusCandidates=mergedRows.filter(o=>{
-      const hasProvider=!!(o.providerId&&(o.providerOrderId||o.smmpartyOrderId||o.provider_order_id));
-      if(!hasProvider)return false;
-      const currentStatus=normalizeProviderStatus(o.providerStatus||o.status||'');
-      if(terminalProviderStatuses.has(currentStatus))return false;
-      const created=Date.parse(o.createdAt||0)||0;if(created&&refreshNow-created>24*60*60*1000)return false;
-      const last=Date.parse(o.statusSyncLastAttemptAt||o.lastCheckedAt||0)||0;return !last||refreshNow-last>=10000;
-    }).sort((a,b)=>{
+    const statusCandidates=mergedRows.filter(o=>shouldAutoRefreshProviderOrderStatus(o,refreshNow)).sort((a,b)=>{
       // Fair rotation: check the least recently checked active order first, so a
       // busy customer cannot starve older pending/processing orders behind two new ones.
       const aLast=Date.parse(a.statusSyncLastAttemptAt||a.lastCheckedAt||0)||0;
       const bLast=Date.parse(b.statusSyncLastAttemptAt||b.lastCheckedAt||0)||0;
-      return aLast-bLast||((Date.parse(b.createdAt||0)||0)-(Date.parse(a.createdAt||0)||0));
-    }).slice(0,2);
+      return aLast-bLast||((Date.parse(a.createdAt||0)||0)-(Date.parse(b.createdAt||0)||0));
+    }).slice(0,1);
     for(const order of statusCandidates){
       try{
         await ensureProviderRuntime(String(order.providerId||''));
@@ -7821,7 +7920,7 @@ async function routeAPI(req,res,urlObj){
       }
     }
     const orders=mergedRows.sort((a,b)=>(Date.parse(b.createdAt||0)||0)-(Date.parse(a.createdAt||0)||0)).slice(0,500);
-    return json(res,200,{ok:true,orders,refreshedProviderStatuses,source:firebaseAvailable?firebaseOrderSource:'hosting-file',warning:warning||undefined});
+    return json(res,200,{ok:true,orders,refreshedProviderStatuses,statusRefreshIntervalMs:4000,source:firebaseAvailable?firebaseOrderSource:'hosting-file',warning:warning||undefined});
   }
   if(p==='/api/user/summary' && req.method==='GET'){
     const s=session(req);if(!s||!['user','admin'].includes(s.role))return json(res,401,{ok:false,error:'يجب تسجيل الدخول'});
@@ -8048,7 +8147,7 @@ async function routeAPI(req,res,urlObj){
     if(result?.walletUnavailable)return json(res,503,{ok:false,error:result.error||'تعذر حجز الرصيد بأمان؛ لم يتم إرسال الطلب'});
     if(result?.duplicateReservation)return json(res,409,{ok:false,error:'يوجد حجز سابق لهذا الطلب قيد التحقق؛ لم نرسل طلباً مكرراً.',uncertain:true,state:result.state});
     if(result?.error)return json(res,502,{ok:false,error:result.error,stage:result.stage||'provider_add',providerHttpStatus:result.providerHttpStatus||null,providerErrorCode:result.providerErrorCode||'',providerDiagnostic:result.providerDiagnostic||'',uncertain:!!result.uncertain,refundPending:!!result.refundPending,refundCredited:!!result.refundCredited,authFailure:!!result.authFailure,siteServiceId,providerServiceId});
-    if(result?.ok){const siteId=String(result.order.id||localId||'');const publicNo=String(result.order.publicOrderNo||result.order.publicOrderNumber||'').trim();const visibleNo=/^\d{4,9}$/.test(publicNo)?publicNo:'قيد الترقيم';const visibleStatus=String(result.order.status||'pending');createUserNotification(username,{type:'order_created',orderId:siteId,status:visibleStatus,title:'تم استلام طلبك #'+visibleNo,message:'رقم طلبك في صدى العراق: #'+visibleNo+' · رقم طلب المزود: '+String(result.order.providerOrderId||'غير متوفر')+' · تُحدّث الحالة من المزود حصراً.',meta:{serviceName:String(result.order.serviceName||'خدمة'),quantity:Number(result.order.quantity||0),providerName:String(result.order.providerName||''),publicOrderNo:visibleNo,siteOrderId:siteId,providerOrderId:String(result.order.providerOrderId||'')}});notifyTelegramNewOrder(result.order,{source:'backend'}).catch(()=>{});return json(res,200,{ok:true,siteOrderId:siteId,publicOrderNo:String(result.order.publicOrderNo||''),siteServiceId:String(result.order.siteServiceId||siteServiceId),serviceId:String(result.order.siteServiceId||siteServiceId),providerServiceId:String(result.order.providerServiceId||providerServiceId),providerId,providerName:prov.name||providerId,providerOrderId:String(result.order.providerOrderId),providerTrackingToken:String(result.providerTrackingToken||''),providerRaw:result.order.providerRaw,providerBalanceBefore:null,chargeUsd,totalIQD:chargeIqd,discountPct:userDiscount,status:visibleStatus,providerStatus:String(result.order.providerStatus||''),providerStatusConfirmed:result.order.providerStatusConfirmed===true,statusSyncState:String(result.order.statusSyncState||'retry_pending'),initialStatusChecked:result.initialStatusChecked===true,initialStatusError:String(result.initialStatusError||''),lastCheckedAt:result.order.lastCheckedAt||null,remains:result.order.remains??null,createdAt:result.order.createdAt});}
+    if(result?.ok){const siteId=String(result.order.id||localId||'');const publicNo=String(result.order.publicOrderNo||result.order.publicOrderNumber||'').trim();const visibleNo=/^\d{4,9}$/.test(publicNo)?publicNo:'قيد الترقيم';const visibleStatus=String(result.order.status||'pending');createAdminNotification({type:'new_order',orderId:siteId,status:visibleStatus,title:'طلب جديد #'+visibleNo,message:'المستخدم: '+username+' · الخدمة: '+String(result.order.serviceName||'خدمة')+' · الكمية: '+Number(result.order.quantity||0).toLocaleString('ar-IQ')});createUserNotification(username,{type:'order_created',orderId:siteId,status:visibleStatus,title:'تم استلام طلبك #'+visibleNo,message:'رقم طلبك في صدى العراق: #'+visibleNo+' · رقم طلب المزود: '+String(result.order.providerOrderId||'غير متوفر')+' · تُحدّث الحالة من المزود حصراً.',meta:{serviceName:String(result.order.serviceName||'خدمة'),quantity:Number(result.order.quantity||0),providerName:String(result.order.providerName||''),publicOrderNo:visibleNo,siteOrderId:siteId,providerOrderId:String(result.order.providerOrderId||'')}});notifyTelegramNewOrder(result.order,{source:'backend'}).catch(()=>{});return json(res,200,{ok:true,siteOrderId:siteId,publicOrderNo:String(result.order.publicOrderNo||''),siteServiceId:String(result.order.siteServiceId||siteServiceId),serviceId:String(result.order.siteServiceId||siteServiceId),providerServiceId:String(result.order.providerServiceId||providerServiceId),providerId,providerName:prov.name||providerId,providerOrderId:String(result.order.providerOrderId),providerTrackingToken:String(result.providerTrackingToken||''),providerRaw:result.order.providerRaw,providerBalanceBefore:null,chargeUsd,totalIQD:chargeIqd,discountPct:userDiscount,status:visibleStatus,providerStatus:String(result.order.providerStatus||''),providerStatusConfirmed:result.order.providerStatusConfirmed===true,statusSyncState:String(result.order.statusSyncState||'retry_pending'),initialStatusChecked:result.initialStatusChecked===true,initialStatusError:String(result.initialStatusError||''),lastCheckedAt:result.order.lastCheckedAt||null,remains:result.order.remains??null,createdAt:result.order.createdAt});}
     return json(res,500,{ok:false,error:'تعذر إنشاء الطلب'});
   }
 
@@ -8186,9 +8285,36 @@ async function routeAPI(req,res,urlObj){
         if(!hits.length){const recent=await firebaseGetQueryJson('orders',{orderBy:'\"$key\"',limitToLast:500},10000);for(const [k,o] of collectionEntries(recent))add(o,k,'firebase');searchMode=qLooksNumeric?'order-number-not-found-in-index':'recent-500-fallback';}
       }
     }catch(e){firebaseAvailable=false;firebaseWarning=String(e.message||e).slice(0,160);}
+    // Reconcile one active provider order per admin refresh. This keeps the admin
+    // queue live without creating a burst of supplier requests when many orders exist.
+    let adminProviderStatusRefreshed=false;
+    if(!rawQ){
+      const candidate=[...merged.entries()].map(([key,order])=>({...order,_firebaseKey:String(order._firebaseKey||order.firebaseKey||order._k||key)}))
+        .filter(order=>!order.legacyHistory&&shouldAutoRefreshProviderOrderStatus(order,Date.now()))
+        .sort((a,b)=>(Date.parse(a.statusSyncLastAttemptAt||a.lastCheckedAt||0)||0)-(Date.parse(b.statusSyncLastAttemptAt||b.lastCheckedAt||0)||0))[0];
+      if(candidate){
+        const lockKey=String(candidate.providerId||'')+'|'+String(candidate.providerOrderId||candidate.smmpartyOrderId||'');
+        globalThis.__SADA_ADMIN_PROVIDER_STATUS_LOCKS=globalThis.__SADA_ADMIN_PROVIDER_STATUS_LOCKS||new Set();
+        const locks=globalThis.__SADA_ADMIN_PROVIDER_STATUS_LOCKS;
+        if(lockKey&&!locks.has(lockKey)){
+          locks.add(lockKey);
+          try{
+            await ensureProviderRuntime(String(candidate.providerId||''));
+            const {prov}=getProviderById(String(candidate.providerId||''),{allowSingleFallback:false});
+            const checked=await checkAndSyncProviderOrderStatus(candidate,prov,{attempts:1,timeoutMs:3500});
+            const updated={...candidate,...(checked.order||{})};
+            const key=keyOf(candidate);if(merged.has(key))merged.set(key,{...merged.get(key),...updated});
+            adminProviderStatusRefreshed=!!checked.ok;
+          }catch(e){
+            const retry=await persistProviderStatusRetryState(candidate,e?.message||e).catch(()=>candidate);
+            const key=keyOf(candidate);if(merged.has(key))merged.set(key,{...merged.get(key),...(retry||{})});
+          }finally{locks.delete(lockKey);}
+        }
+      }
+    }
     // This list endpoint deliberately does not load the whole users node; email/profile fields are loaded per-user on demand.
     const rows=[...merged.values()].map(o=>({...o,email:String(o.email||o.userEmail||o.memberEmail||'')})).filter(o=>{const hay=[o.id,o.publicOrderNo,o.publicOrderNumber,o.siteOrderId,o.user,o.username,o.userName,o.name,o.email,o.link,o.serviceName,o.providerOrderId,o.legacyOrderId,o.legacyOrderNumber].map(v=>String(v||'').toLowerCase()).join(' ');const providerRaw=o.providerStatus||o.smmStatus||o.provider_status||'';const hasProvider=!!(o.providerId&& (o.providerOrderId||o.smmpartyOrderId||o.provider_order_id));const providerConfirmed=o.providerStatusConfirmed===true;const rawStatus=String(hasProvider&&!providerConfirmed?'pending':providerConfirmed?(providerRaw||o.status||'pending'):(o.status||providerRaw||'pending')).trim().toLowerCase().replace(/[\s_-]+/g,' ');const norm=(rawStatus==='in progress'||rawStatus==='inprogress')?'in progress':normalizeProviderStatus(rawStatus);const wanted=(st==='in progress'||st==='in_progress')?'in progress':normalizeProviderStatus(st);return (!q||hay.includes(q))&&(!st||st==='all'||norm===wanted);}).sort((a,b)=>(Date.parse(b.createdAt||0)||0)-(Date.parse(a.createdAt||0)||0)).slice(0,500);
-    return json(res,200,{ok:true,orders:rows,firebaseAvailable,warning:firebaseWarning||undefined,searchMode,limit:500,readOnlyLegacyCount:rows.filter(x=>x.legacyHistory).length});
+    return json(res,200,{ok:true,orders:rows,firebaseAvailable,warning:firebaseWarning||undefined,searchMode,limit:500,providerStatusRefreshed:adminProviderStatusRefreshed,statusRefreshIntervalMs:4000,readOnlyLegacyCount:rows.filter(x=>x.legacyHistory).length});
   }
   if(p==='/api/admin/order-status' && req.method==='POST'){
     if(!isAdmin(req)) return json(res,403,{ok:false,error:'غير مصرح'});
