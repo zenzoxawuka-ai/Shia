@@ -4,10 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <meta name="sada-version" content="3.2">
-<meta name="sada-build-id" content="SADA-3.2-R16-CONSOLIDATED-FIXES-20261102">
+<meta name="sada-build-id" content="SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102">
 <script id="sada169-boot-route-gate">
 (function(){
-  const BUILD='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+  const BUILD='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
   const root=document.documentElement;
   root.classList.add('sada-boot-pending');
   try{window.__SADA_BOOT_HAD_SESSION=Boolean(localStorage.getItem('sadairaq_session_token')||localStorage.getItem('tz_u'));}catch(_){window.__SADA_BOOT_HAD_SESSION=false}
@@ -5277,24 +5277,17 @@ function renderSmmProvidersList(container){
   });
 }
 
-function saveSmmProvidersToFB(){
-  return fbReady.then(function(){
-  if(!FB_OK){
-    toast('⚠️ قاعدة البيانات مش متصلة — راجع إعدادات Firebase (CFG.firebase)، التعديل مش هيتحفظ','err');
-    throw new Error('FB_NOT_CONNECTED');
+async function saveSmmProvidersToFB(){
+  // Provider secrets are server-owned. Never replace the Firebase provider/secrets roots
+  // from a browser list: /api/providers intentionally returns metadata without API keys.
+  // A whole-node .set() here used to erase another provider's saved key after a list refresh.
+  if(CU?.role!=='admin') throw new Error('غير مصرح بحفظ إعدادات المزودين');
+  const providers=Array.isArray(CFG?.smm?.providers)?CFG.smm.providers:[];
+  const result=await apiJSON('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({providers,activeProvider:String(CFG.smm.activeProvider||''),mode:'merge'})});
+  if(!result?.ok || result.persistent!==true || result.firebaseSynced!==true){
+    throw new Error(result?.error||'لم يتم تأكيد حفظ مفاتيح المزودين بصورة دائمة في Firebase');
   }
-  var obj={};
-  CFG.smm.providers.forEach(function(p){
-    obj[p.id]={name:p.name,url:p.url,key:p.key||''};
-  });
-  var p1=DB.ref('config/smmProviders').set(obj);
-  var p2=CFG.smm.activeProvider ? DB.ref('config/smmActive').set(CFG.smm.activeProvider) : Promise.resolve();
-  var p3=apiJSON('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({providers:CFG.smm.providers,activeProvider:CFG.smm.activeProvider,mode:'merge'})});
-  return Promise.all([p1,p2,p3]).catch(function(e){
-    toast('❌ فشل الحفظ في قاعدة البيانات: '+e.message,'err');
-    throw e;
-  });
-  });
+  return result;
 }
 
 function modalAddSmmProvider(onDone, editProv){
@@ -6151,20 +6144,9 @@ function tgSend(msg){fetch(`https://api.telegram.org/bot${CFG.tg.token}/sendMess
   };
 
   // Server-backed provider storage; no need to depend on Firebase for provider secrets.
-  window.saveSmmProvidersToFB = async function(){
-    if(CU?.role!=='admin') throw new Error('غير مصرح');
-    const list=CFG.smm.providers||[];
-    const result=await apiJSON('/api/providers',{method:'POST',body:JSON.stringify({providers:list,activeProvider:CFG.smm.activeProvider||''})});
-    if(FB_OK&&DB){
-      const existingSnap=await DB.ref('config/smmProviders').once('value').catch(()=>null);
-      const fb={}; const secure={};
-      list.forEach(p=>{fb[p.id]={id:p.id,name:p.name,url:p.url,hasKey:!!p.key}; if(p.key)secure[p.id]={id:p.id,key:p.key,name:p.name,url:p.url};});
-      await DB.ref('config/smmProviders').set(fb);
-      if(CU?.role==='admin') await DB.ref('config/smmProviderSecrets').set(secure);
-      localStorage.setItem('sadairaq_provider_backup',JSON.stringify(list.map(p=>({id:p.id,name:p.name,url:p.url,key:p.key||''}))));
-      await DB.ref('config/smmActive').set(CFG.smm.activeProvider||'');
-    }
-    return result;
+  window.saveSmmProvidersToFB = async function(options={}){
+    // Keep the browser away from whole-node replacement of server-owned API secrets.
+    return apiJSON('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({providers:CFG.smm.providers||[],activeProvider:CFG.smm.activeProvider||'',mode:'merge',restoreDeleted:options?.restoreDeleted===true})});
   };
   window.loadSmmProviders = async function(){
     let serverLoaded=false;let serverList=[];let serverActive='';
@@ -7114,7 +7096,7 @@ function tgSend(msg){fetch(`https://api.telegram.org/bot${CFG.tg.token}/sendMess
   };
   // Refresh the catalog index only; never rewrite every service's image on page load.
   setTimeout(()=>{hydrateAllCategoryMeta().then(()=>{repairServiceIndex();try{window.buildCatDD?.();window.buildSvcDD?.(SEL_CAT||'__all__')}catch(_){}})},900);
-  window.SadaIraqBuildId='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+  window.SadaIraqBuildId='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
 })();
 
 </script>
@@ -7176,9 +7158,11 @@ function tgSend(msg){fetch(`https://api.telegram.org/bot${CFG.tg.token}/sendMess
       }
     }catch(e){backendError=String(e?.message||e);console.warn('Sada v1.5.76 provider API list:',backendError)}
 
-    // Recover provider metadata and secret from the two current Firebase paths (and legacy inline keys).
+    // Recover provider metadata/secrets from Firebase only when the server has no usable registry.
+    // When Railway returns providers, its exact providerId->secret mapping is authoritative;
+    // merging a stale browser Firebase snapshot over it caused provider-key mismatches.
     let remoteActive='';const remoteForBackend=[];
-    if(FB_OK&&DB){
+    if(FB_OK&&DB&&(!serverLoaded||!serverList.length)){
       try{
         const [metaSnap,secretSnap,deletedSnap,activeSnap]=await Promise.all([
           DB.ref('config/smmProviders').once('value'),
@@ -8881,7 +8865,7 @@ function admPays(){nav('admin');setTimeout(()=>admNavTo('payments',null),150);}
       b=document.createElement('div'); b.id='sadairaq-version-badge';
       document.body.appendChild(b);
     }
-    const EXPECTED_BUILD='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+    const EXPECTED_BUILD='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
     const applyClientVersion=()=>{
       b.dataset.deployState='checking';
       b.textContent='صدى العراق · الإصدار '+SADA_VERSION+' · جارٍ فحص الخادم…';
@@ -9231,7 +9215,7 @@ function admPays(){nav('admin');setTimeout(()=>admNavTo('payments',null),150);}
   const ensure=fn=>document.readyState==='loading'?document.addEventListener('DOMContentLoaded',fn,{once:true}):fn();
   window.SECTION_META=window.SECTION_META||{};
   window.SadaIraqVersion=V;
-window.SadaIraqBuildId='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+window.SadaIraqBuildId='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
 
   function safe(v){return txt(v).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[m]));}
   function appLabel(id){const p=(CFG.platforms||[]).find(x=>x.id===id);return p?.lbl||id||'عام';}
@@ -9660,7 +9644,7 @@ const safe=v=>String(v??'').replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':
 const api=window.apiJSON||((p,o)=>fetch(p,Object.assign({credentials:'include',cache:'no-store',headers:{'Content-Type':'application/json'}},o||{})).then(async r=>{const t=await r.text();let d={};try{d=t?JSON.parse(t):{}}catch(_){d={error:t}}if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));return d;}));
 const mk=window.mk||((tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e;});
 window.SadaIraqVersion=V;
-window.SadaIraqBuildId='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+window.SadaIraqBuildId='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
 
 function setVersion(){
   const b=$('sadairaq-version-badge');
@@ -12971,7 +12955,7 @@ curl -X POST ${base}/order -H "Authorization: Bearer YOUR_API_KEY" -H "Content-T
   document.addEventListener('DOMContentLoaded',startFinal);window.addEventListener('load',()=>setTimeout(startFinal,100));setTimeout(startFinal,250);setTimeout(startFinal,1200);
   // Observe the whole document so both independent controls survive page/route re-renders.
   if(document.body){const mo=new MutationObserver(()=>{ensureOrderWhatsApp();});mo.observe(document.body,{childList:true});}
-  window.__SADA_V1562_DIAGNOSTIC__={version:'1.6.86',buildId:'SADA-3.2-R16-CONSOLIDATED-FIXES-20261102',hasFetchGuard:true,orderAudit:true};
+  window.__SADA_V1562_DIAGNOSTIC__={version:'1.6.86',buildId:'SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102',hasFetchGuard:true,orderAudit:true};
 })();
 </script>
 
@@ -13814,7 +13798,7 @@ body:has(#modal-mask.on) #wa-float{display:none!important}
 <script id="sada1666-welcome-refunds-admin-splash">
 (function(){
  'use strict';
- const BUILD='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+ const BUILD='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
  const $=id=>document.getElementById(id);
  const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -14028,7 +14012,7 @@ body:has(#modal-mask.on) #wa-float{display:none!important}
 <script id="sada167-earn-notifications-dashboard">
 (function(){
 'use strict';
-const BUILD='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+const BUILD='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
 const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const money=v=>'$'+Math.max(0,Number(v)||0).toFixed(2);
@@ -14690,7 +14674,7 @@ window.SADA_V1626_RELEASE={version:'1.6.86',features:['earn-page-premium-order',
 (function(){
   'use strict';
   const EXPECTED_VERSION='3.2';
-  const EXPECTED_BUILD='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+  const EXPECTED_BUILD='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
   const $=id=>document.getElementById(id);
   function ensureBadge(){
     let b=$('sadairaq-version-badge');
@@ -17329,7 +17313,7 @@ window.SADA1637_UI_FIXES={version:'1.6.86',openAsiaCell:openWizard,polishOrderFo
 </style>
 <script id="sada-1.6.86-final-ui-enforcement">
 (()=>{'use strict';
- const BUILD='SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+ const BUILD='SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
  const $=id=>document.getElementById(id);
  const oldPromo=/(?:اشتراكات\s*و\s*خدمات\s*خاصة|تصفح\s*الخدمات\s*الخاصة|خدمات\s+مستقلة\s+عن\s+المزود)/i;
  const browse=/تصفح\s*الخدمات\s*الخاصة/i;

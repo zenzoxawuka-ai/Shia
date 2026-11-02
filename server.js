@@ -45,7 +45,7 @@ function purgeCatalogServiceSnapshots(){
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
 const APP_VERSION = '3.2';
-const BUILD_ID = 'SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
+const BUILD_ID = 'SADA-3.2-R17-PROVIDER-SECRET-ISOLATION-20261102';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -2140,7 +2140,8 @@ async function apiSmm(req,res,urlObj){
   let {pid:providerId,prov}=resolved;
   const suppliedUrl=String(body.url||body.apiUrl||urlObj.searchParams.get('_url')||'').trim();
   const suppliedKey=String(body.key||body.apiKey||urlObj.searchParams.get('_key')||'').trim();
-  if(body.syncProvider===true && requestedId && suppliedUrl && suppliedKey){
+  const temporaryProviderTest=/^__test__$/i.test(requestedId);
+  if(requestedId && suppliedUrl && suppliedKey && (body.syncProvider===true || ((!prov?.url||!prov?.key) && !temporaryProviderTest))){
     try{
       const id=providerIdInStore(store,requestedId)||normalizeProviderId(requestedId);
       if(!id) throw new Error('معرّف المزود غير صالح');
@@ -2155,11 +2156,20 @@ async function apiSmm(req,res,urlObj){
       const nextActive=body.activateProvider===true?id:(providerIdInStore(store,store.activeProvider)||id);
       writeJSON('providers.runtime.json',{activeProvider:nextActive,providers,deletedProviderIds:deleted,updatedAt:nowISO()});
       const k=firebaseSafeKey(id);
-      await Promise.allSettled([
-        firebaseWriteJson('config/smmProviders/'+k,{id,name,url,hasKey:true}),
-        firebaseWriteJson('config/smmProviderSecrets/'+k,{id,name,url,key:suppliedKey}),
+      await Promise.all([
+        firebaseDeleteJson('config/smmDeletedProviders/'+k),
+        firebaseWriteJson('config/smmProviders/'+k,{id,name,url,hasKey:true,updatedAt:nowISO()}),
+        firebaseWriteJson('config/smmProviderSecrets/'+k,{id,name,url,key:suppliedKey,updatedAt:nowISO()}),
         firebaseWriteJson('config/smmActive',nextActive)
       ]);
+      const [savedMeta,savedSecret,activeCheck]=await Promise.all([
+        firebaseGetJson('config/smmProviders/'+k,6500),
+        firebaseGetJson('config/smmProviderSecrets/'+k,6500),
+        firebaseGetJson('config/smmActive',5000)
+      ]);
+      const savedKey=usableProviderKey(savedSecret?.key), wantedKey=String(suppliedKey);
+      const keyMatches=savedKey.length===wantedKey.length&&savedKey.length>0&&crypto.timingSafeEqual(Buffer.from(savedKey,'utf8'),Buffer.from(wantedKey,'utf8'));
+      if(String(savedMeta?.id||'')!==id||String(savedSecret?.id||'')!==id||!keyMatches||String(savedSecret?.url||'')!==url||String(activeCheck||'')!==nextActive)throw new Error('لم يتأكد حفظ مفتاح هذا المزود في Firebase بعد التحديث.');
       store=providerStore(); resolved=getProviderById(id,{allowSingleFallback:false});
       providerId=resolved.pid||id; prov=resolved.prov||saved;
     }catch(e){return json(res,422,{error:'تعذر تثبيت بيانات المزود: '+String(e.message||e)});}
@@ -8626,10 +8636,24 @@ async function routeAPI(req,res,urlObj){
       for(const [id,v] of Object.entries(incoming)){
         const k=firebaseSafeKey(id);
         await firebaseDeleteJson('config/smmDeletedProviders/'+k);
-        await firebaseWriteJson('config/smmProviders/'+k,{id,name:v.name,url:v.url,hasKey:true});
-        await firebaseWriteJson('config/smmProviderSecrets/'+k,{id,key:v.key,name:v.name,url:v.url});
+        await firebaseWriteJson('config/smmProviders/'+k,{id,name:v.name,url:v.url,hasKey:true,updatedAt:nowISO()});
+        await firebaseWriteJson('config/smmProviderSecrets/'+k,{id,key:v.key,name:v.name,url:v.url,updatedAt:nowISO()});
+        // A successful HTTP write alone is not enough: verify the exact provider record
+        // and its secret by reading them back before reporting durable provider storage.
+        const [savedMeta,savedSecret]=await Promise.all([
+          firebaseGetJson('config/smmProviders/'+k,6500),
+          firebaseGetJson('config/smmProviderSecrets/'+k,6500)
+        ]);
+        const savedKey=usableProviderKey(savedSecret?.key);
+        const wantedKey=String(v.key||'');
+        const keyMatches=savedKey.length===wantedKey.length && savedKey.length>0 && crypto.timingSafeEqual(Buffer.from(savedKey,'utf8'),Buffer.from(wantedKey,'utf8'));
+        if(String(savedMeta?.id||'')!==String(id)||String(savedSecret?.id||'')!==String(id)||!keyMatches||String(savedSecret?.url||'')!==String(v.url||'')){
+          throw new Error('لم يتأكد استرجاع مفتاح المزود '+String(v.name||id)+' بعد الحفظ. لم نعتمد الحفظ الدائم.');
+        }
       }
       await firebaseWriteJson('config/smmActive',active);
+      const activeCheck=await firebaseGetJson('config/smmActive',5000);
+      if(String(activeCheck||'')!==String(active||''))throw new Error('لم يتم التحقق من المزود النشط بعد الحفظ.');
     }catch(e){firebaseSynced=false;console.warn('provider save Firebase sync failed:',e?.message||e);}
     if(!firebaseSynced)return json(res,503,{ok:false,count:Object.keys(out).length,activeProvider:active,firebaseSynced:false,persistent:false,needsClientPersistence:true,error:'تم تحديث نسخة تشغيل مؤقتة فقط، لكن Firebase لم تؤكد حفظ بيانات المزودين. لا تعتبر العملية ناجحة؛ افحص إعدادات Firebase ثم أعد الحفظ.',received:list.length,saved:Object.keys(incoming).length});
     return json(res,200,{ok:true,count:Object.keys(out).length,activeProvider:active,firebaseSynced:true,persistent:true,storageMode:'firebase',needsClientPersistence:false,warning:'',received:list.length,saved:Object.keys(incoming).length});
@@ -8765,8 +8789,10 @@ async function hydrateProviderRuntimeFromFirebase(){
     if(!id||blocked)continue;
     const prevKey=providerIdInStore({providers},id);
     const prev=prevKey?providers[prevKey]:{};
-    const urlRaw=String(secret.url||meta.url||prev.url||'').trim();
-    const key=usableProviderKey(secret.key)||usableProviderKey(meta.key)||usableProviderKey(prev.key);
+    // A provider already persisted on the Railway volume is newer than any stale remote snapshot.
+    // Firebase is the recovery source only when this runtime has no usable credential yet.
+    const urlRaw=String(prev.url||secret.url||meta.url||'').trim();
+    const key=usableProviderKey(prev.key)||usableProviderKey(secret.key)||usableProviderKey(meta.key);
     if(!urlRaw||!key)continue;
     let url=urlRaw; try{url=normalizeProviderApiUrl(urlRaw)}catch(_){}
     providers[id]={...prev,...meta,...secret,id,name:String(meta.name||secret.name||prev.name||id),url,key};
