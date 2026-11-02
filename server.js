@@ -45,7 +45,7 @@ function purgeCatalogServiceSnapshots(){
 purgeCatalogServiceSnapshots();
 const APP_NAME = 'صدى العراق';
 const APP_VERSION = '3.2';
-const BUILD_ID = 'SADA-3.2-R13.1-PROVIDER-ADD-METAROOT-HOTFIX-20261102';
+const BUILD_ID = 'SADA-3.2-R16-CONSOLIDATED-FIXES-20261102';
 // Keep the owner's admin identity available after packaging, but store only a scrypt hash
 // in the project. Railway variables can still explicitly override this packaged credential.
 function loadBundledAdminAuth(){
@@ -322,6 +322,12 @@ let CATALOG_FIREBASE_READY = false, CATALOG_FIREBASE_READY_IN_FLIGHT = null;
 // One compact catalog snapshot replaces several parallel full-catalog reads on mobile.
 const CATALOG_SNAPSHOT_CACHE = new Map();
 const CATALOG_SNAPSHOT_IN_FLIGHT = new Map();
+let CATALOG_SNAPSHOT_EPOCH = 0;
+function invalidateCatalogSnapshotCache(){
+  CATALOG_SNAPSHOT_EPOCH++;
+  CATALOG_SNAPSHOT_CACHE.clear();
+  CATALOG_SNAPSHOT_IN_FLIGHT.clear();
+}
 function catalogPathSpec(rawPath){
   const parts=String(rawPath||'').split('/').filter(Boolean).map(x=>String(x));
   if(!parts.length) return null;
@@ -381,8 +387,11 @@ function catalogSectionIndexForPlatform(platformValue){
   const byName=new Map();
   const add=(name,row=null)=>{
     const label=String(name||'').trim(),key=normalizeCatalogLabel(label);if(!label||!key)return;
-    let entry=byName.get(key);if(!entry){entry={name:label,count:0,minPrice:null,serviceKeys:[]};byName.set(key,entry);}
-    if(row){entry.count++;entry.serviceKeys.push(String(row.fbKey||row.key||row.siteServiceId||row.id||''));
+    let entry=byName.get(key);if(!entry){entry={name:label,count:0,minPrice:null,serviceKeys:[],_serviceKeySet:new Set()};byName.set(key,entry);}
+    if(row){
+      const serviceKey=String(row.fbKey||row.key||row.siteServiceId||row.id||'');
+      if(!serviceKey||entry._serviceKeySet.has(serviceKey))return;
+      entry._serviceKeySet.add(serviceKey);entry.count++;entry.serviceKeys.push(serviceKey);
       let price=null;
       for(const field of ['sellingUsd','rateUsd','orderPriceUsd','fixedPriceUsd','providerRateUsd','smmRateUsd','smmRate','rate']){const raw=row[field];if(raw===undefined||raw===null||String(raw).trim()==='')continue;const n=Number(raw);if(Number.isFinite(n)&&n>=0){price=n;break;}}
       if(price===null&&row.price!==undefined&&row.price!==null&&String(row.price).trim()!==''){const n=Number(row.price);if(Number.isFinite(n)&&n>=0)price=n/FIXED_RATE;}
@@ -398,16 +407,19 @@ function catalogSectionIndexForPlatform(platformValue){
     if(!meta||typeof meta!=='object')continue;
     const name=String(meta.name||key).trim();if(!name)continue;
     const platforms=[...(Array.isArray(meta.platforms)?meta.platforms:[]),meta.platform,meta.imagePlatform,meta.pinnedPlatform].filter(Boolean);
-    const linked=(Array.isArray(meta.serviceKeys)?meta.serviceKeys:[]).some(serviceKey=>{
-      const row=services[String(serviceKey)];return row&&catalogRowHasPlatform(row,scope,metaRoot)&&row.deleted!==true&&row.enabled!==false;
-    });
-    if(platforms.some(value=>catalogPlatformScope(value)===scope)||linked){add(name,null);}
+    const metadataPlatformMatches=platforms.some(value=>catalogPlatformScope(value)===scope);
+    const linkedKeys=(Array.isArray(meta.serviceKeys)?meta.serviceKeys:[]).map(String);
+    const linkedRows=linkedKeys.map(serviceKey=>({serviceKey,row:services[serviceKey]})).filter(({row})=>row&&row.deleted!==true&&row.enabled!==false&&(metadataPlatformMatches||catalogRowHasPlatform(row,scope,metaRoot)));
+    if(metadataPlatformMatches||linkedRows.length){
+      add(name,null);
+      for(const {serviceKey,row} of linkedRows)add(name,{...row,fbKey:row.fbKey||serviceKey});
+    }
   }
   const settings=catalogObject(readJSON('catalog_settings.json',{})).catalogOrder||{};
   const scoped=catalogObject(catalogObject(settings.platforms)[scope]);
   const pins=catalogObject(scoped.pinnedPositions);
   const pinFor=name=>{const match=Object.entries(pins).find(([key])=>normalizeCatalogLabel(key)===normalizeCatalogLabel(name));const n=Number(match?.[1]);return Number.isInteger(n)&&n>0?n:null;};
-  const entries=[...byName.values()].map(entry=>({...entry,pinPosition:pinFor(entry.name)}));
+  const entries=[...byName.values()].map(entry=>{const {_serviceKeySet,...publicEntry}=entry;return {...publicEntry,pinPosition:pinFor(entry.name)}});
   // Pinned positions are absolute slots; all other sections fill gaps in ascending price order.
   const ordered=applyCatalogPinnedPositions(entries);
   return {ok:true,platform:scope,sections:ordered.map((entry,index)=>({...entry,currentPosition:index+1,serviceKeys:undefined}))};
@@ -756,7 +768,7 @@ function catalogApplyBatch(updates){
     else if(!validated.some(x=>x.spec.bucket==='services'&&x.spec.parts.length>0)){const keys=new Set([...Object.keys(beforeServices||{}),...Object.keys(after||{})]);for(const key of keys)if(JSON.stringify(beforeServices?.[key]||null)!==JSON.stringify(after?.[key]||null))changes.push({key,oldRow:beforeServices?.[key]||null,newRow:after?.[key]||null});}
     syncCatalogServiceOrderChanges(changes);
   }
-  CATALOG_SNAPSHOT_CACHE.clear();
+  invalidateCatalogSnapshotCache();
   // Re-run canonical ordering after possible new category metadata and service memberships.
   const cfg=readJSON('catalog_settings.json',{});if(cfg.catalogOrder){const normalized=canonicalCatalogOrder(cfg.catalogOrder,readJSON('category_meta.json',{}));if(JSON.stringify(normalized)!==JSON.stringify(cfg.catalogOrder)){cfg.catalogOrder=normalized;writeJSON('catalog_settings.json',cfg);}}
   return {ok:true,count:entries.length,storage:'hosting-json'};
@@ -3851,7 +3863,7 @@ function telegramConfig(){
   const overdueEnv=String(process.env.TELEGRAM_OVERDUE_CHAT_ID||'').trim();
   const adminEnv=String(process.env.TELEGRAM_ADMIN_CHAT_ID||'').trim();
   const legacyChannel=/^@[A-Za-z0-9_]{3,}$/i.test(legacyChat)||/^-100\d{5,}$/.test(legacyChat)?legacyChat:'';
-  const activationChat=String(activationEnv||cfg.activationChat||TELEGRAM_CHANNELS_REMOTE.activationChat||legacyChannel).trim();
+  const activationChat=String(activationEnv||cfg.activationChat||TELEGRAM_CHANNELS_REMOTE.activationChat||legacyChannel||'-1004403189762').trim();
   const overdueChat=String(overdueEnv||cfg.overdueChat||TELEGRAM_CHANNELS_REMOTE.overdueChat||'').trim();
   const adminChat=String(adminEnv||cfg.adminChat||TELEGRAM_CHANNELS_REMOTE.adminChat||'').trim();
   const envToggle=String(process.env.TELEGRAM_NOTIFICATIONS_ENABLED||'').trim();
@@ -5867,7 +5879,7 @@ async function routeAPI(req,res,urlObj){
       const nextOrder={...base,platforms,updatedAt:nowISO(),updatedBy:String(currentSession?.username||ADMIN_USER)};
       await persistFirebaseCatalogPatch({'settings/catalogOrder':nextOrder},{verify:true,atomic:true,timeoutMs:25000});
       const cfg=readJSON('catalog_settings.json',{});cfg.catalogOrder=nextOrder;cfg.firebaseCatalogLastVerifiedAt=nowISO();writeJSON('catalog_settings.json',cfg);
-      CATALOG_SNAPSHOT_CACHE.clear();try{purgeCatalogServiceSnapshots()}catch(_){}
+      invalidateCatalogSnapshotCache();try{purgeCatalogServiceSnapshots()}catch(_){}
       const verified=await firebaseGetJson('settings/catalogOrder',10000);
       if(!catalogValuesEqual(verified,nextOrder))throw new Error('حُفظ الترتيب لكن لم تتطابق قراءة التحقق من Firebase.');
       return json(res,200,{ok:true,verified:true,platform:index.platform,pins:nextPins,sections:catalogSectionIndexForPlatform(index.platform).sections,checkedAt:nowISO()});
@@ -5980,7 +5992,7 @@ async function routeAPI(req,res,urlObj){
       }
       const updates={['services/'+serviceKey]:serviceRow,'settings/catalogOrder':order,...metaUpdates};
       const applied=catalogApplyBatch(updates);if(!applied.ok)return json(res,422,{ok:false,error:applied.error||'تعذر تجهيز بيانات الخدمة.'});
-      try{await persistCatalogBatchToFirebase(updates);await firebaseWriteJson('settings/svcsVersion',String(Date.now()),8000);CATALOG_SNAPSHOT_CACHE.clear();purgeCatalogServiceSnapshots();}
+      try{await persistCatalogBatchToFirebase(updates);await firebaseWriteJson('settings/svcsVersion',String(Date.now()),8000);invalidateCatalogSnapshotCache();purgeCatalogServiceSnapshots();}
       catch(e){try{await reloadLocalCatalogFromFirebase()}catch(reloadError){console.error('Provider service add rollback reload failed:',String(reloadError.message||reloadError))}return json(res,503,{ok:false,persisted:false,verified:false,error:'لم يتم تأكيد إضافة الخدمة في Firebase؛ لم نعلن نجاحها. '+String(e.message||e).slice(0,180)});}
       return json(res,200,{ok:true,persisted:true,verified:true,created:!existingRow,categoryMode,serviceKey,serviceName,providerId,providerName:String(prov.name||providerId),providerServiceId,categories:mergedGroups.filter(name=>categories.some(c=>normalizeCatalogLabel(c)===normalizeCatalogLabel(name))),platform,providerRateUsd:baseRate,sellingUsd,markupPct,message:existingRow?'تم تحديث الخدمة وربطها بالأقسام المختارة.':'تمت إضافة الخدمة الحقيقية من المزود وربطها بالأقسام المختارة.'});
     }catch(e){return json(res,502,{ok:false,persisted:false,verified:false,error:'تعذر التحقق من الخدمة أو إضافتها: '+String(e.message||e).slice(0,200)});}
@@ -6088,6 +6100,7 @@ async function routeAPI(req,res,urlObj){
     const includeUnapproved=role==='admin'&&urlObj.searchParams.get('includeUnapprovedAutoImports')==='1';
     const cacheKey=role+':'+(includeUnapproved?'unapproved':'approved');
     const force=urlObj.searchParams.get('fresh')==='1';
+    const snapshotEpoch=CATALOG_SNAPSHOT_EPOCH;
     const cached=CATALOG_SNAPSHOT_CACHE.get(cacheKey);
     if(!force&&cached&&Date.now()-cached.at<4500)return json(res,200,{...cached.payload,cached:true});
     let pending=null,ownsPending=false;
@@ -6128,7 +6141,7 @@ async function routeAPI(req,res,urlObj){
         if(!force){CATALOG_SNAPSHOT_IN_FLIGHT.set(cacheKey,pending);ownsPending=true;}
       }
       const payload=await pending;
-      if(!force)CATALOG_SNAPSHOT_CACHE.set(cacheKey,{at:Date.now(),payload});
+      if(!force&&snapshotEpoch===CATALOG_SNAPSHOT_EPOCH)CATALOG_SNAPSHOT_CACHE.set(cacheKey,{at:Date.now(),payload});
       return json(res,200,payload);
     }catch(e){
       return json(res,503,{ok:false,error:'تعذر تحميل لقطة الخدمات والأقسام الموثوقة من Firebase: '+String(e.message||e).slice(0,200),source:'firebase',storageMode:'firebase'});
@@ -8046,7 +8059,7 @@ async function routeAPI(req,res,urlObj){
     const wait=rateLimit(req,'provider'); if(wait)return json(res,429,{ok:false,error:'طلبات الرصيد كثيرة، أعد المحاولة لاحقاً'},{'Retry-After':String(wait)});
     if(!isAdmin(req))return json(res,403,{ok:false,error:'غير مصرح — جلسة الإدارة غير صالحة'});
     const requested=String(urlObj.searchParams.get('provider')||''); await ensureProviderRuntime(requested);
-    const {prov,pid}=getProviderById(requested,{allowSingleFallback:true}); if(!prov?.url||!prov?.key)return json(res,404,{ok:false,error:'المزود غير موجود أو بيانات URL/Key غير مكتملة'});
+    const {prov,pid}=getProviderById(requested,{allowSingleFallback:!requested}); if(!prov?.url||!prov?.key)return json(res,404,{ok:false,error:'المزود غير موجود أو بيانات URL/Key غير مكتملة'});
     try{const d=await providerRequest(prov,{action:'balance'}); const balance=normalizeProviderBalance(d); if(balance===null)return json(res,502,{ok:false,error:'المزود لم يرجع قيمة رصيد صالحة'}); return json(res,200,{ok:true,providerId:pid,providerName:prov.name||pid,balance,currency:normalizeProviderCurrency(d),checkedAt:new Date().toISOString()});}
     catch(e){return json(res,502,{ok:false,error:e.name==='AbortError'?'انتهت مهلة الاتصال بالمزود':e.message});}
   }
@@ -8515,7 +8528,7 @@ async function routeAPI(req,res,urlObj){
     if(!isAdmin(req)) return json(res,403,{ok:false,error:'غير مصرح — جلسة الإدارة غير صالحة'});
     const id=String(urlObj.searchParams.get('provider')||'');
     await ensureProviderRuntime(id);
-    const {pid,prov}=getProviderById(id,{allowSingleFallback:true});
+    const {pid,prov}=getProviderById(id,{allowSingleFallback:!id});
     if(!prov?.key) return json(res,404,{ok:false,error:'المزود غير موجود أو مفتاحه غير محفوظ'});
     return json(res,200,{ok:true,providerId:pid,key:String(prov.key)});
   }
@@ -8555,7 +8568,9 @@ async function routeAPI(req,res,urlObj){
       return json(res,200,{activeProvider:store.activeProvider||'',providers:safe,storageMode:DATA_IS_EXTERNAL?'external-directory':'release-local'});
     }
     const b=await bodyJSON(req); const list=Array.isArray(b.providers)?b.providers:[];
-    await ensureProviderRuntime(''); store=providerStore();
+    // Hydrate every provider independently before merging a submitted provider list.
+    await hydrateProviderRuntimeFromFirebase().catch(e=>console.warn('[PROVIDER_HYDRATE_BEFORE_SAVE]',String(e?.message||e).slice(0,120)));
+    store=providerStore();
     const incoming={};
     for(const item of list){
       if(!item||typeof item!=='object') continue;
@@ -9015,6 +9030,8 @@ async function importProviderCatalogBulk(payload,actor='admin'){
       if(freshSettings.catalogOrder&&!catalogValuesEqual(remoteOrderAfter,freshSettings.catalogOrder))throw new Error('لم يتأكد حفظ ترتيب الأقسام داخل Firebase.');
       if(String(remoteVersionAfter??'')!==firebaseVersion)throw new Error('لم يتأكد تحديث إصدار الكتالوج داخل Firebase.');
       CATALOG_FIREBASE_READY=true;
+      invalidateCatalogSnapshotCache();
+      try{purgeCatalogServiceSnapshots()}catch(_){}
       return {added,updated,restoredArchived,skipped,total:serviceKeys.length,sections:categoryMembership.size,serviceKeys,verified:true,firebaseVerified:true,storage:'firebase',verificationMode:'single-bulk-patch-and-catalog-readback',checkedAt:nowISO()};
     }catch(e){
       try{
